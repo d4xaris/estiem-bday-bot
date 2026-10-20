@@ -1,0 +1,19 @@
+{
+  "name": "estiem-bday-bot",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "^1.4.3"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "google-auth-library": "^11.3.1"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc"
+  }
+}
