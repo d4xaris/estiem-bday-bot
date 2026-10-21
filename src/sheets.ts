@@ -8,28 +8,35 @@ export interface Member {
     status: string;   // Колонка C
 }
 
+// Токен із повторними спробами (Google інколи тимчасово відхиляє підпис)
+async function getTokenWithRetry(auth: GoogleAuth, attempts = 3): Promise<string> {
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            const token = await auth.getAccessToken();
+            if (token) return token;
+        } catch (e) {
+            if (i === attempts) throw e;
+        }
+        await new Promise((r) => setTimeout(r, 5000 * i));
+    }
+    throw new Error('Не вдалося отримати access token для сервісного акаунта');
+}
+
 export async function getMembers(): Promise<Member[]> {
     const members: Member[] = [];
 
-    // Авторизація через сервісний акаунт
     const auth = new GoogleAuth({
         credentials: config.googleServiceAccount,
         scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     });
 
-    const accessToken = await auth.getAccessToken();
-    if (!accessToken) {
-        throw new Error('Не вдалося отримати access token для сервісного акаунта');
-    }
+    const accessToken = await getTokenWithRetry(auth);
 
-    // Діапазон A:E, щоб індекси відповідали колонкам:
-    // row[0] = A (порожня), row[1] = B (ім'я), row[2] = C (статус),
-    // row[3] = D (дата народження), row[4] = E (нікнейм)
+    // A:E, щоб індекси збігалися з колонками:
+    // row[1] = B (ім'я), row[2] = C (статус), row[3] = D (дата), row[4] = E (нікнейм)
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.sheetId}/values/A:E`;
     const response = await fetch(url, {
-        headers: {
-            Authorization: `Bearer ${accessToken}`,
-        },
+        headers: { Authorization: `Bearer ${accessToken}` },
     });
 
     if (!response.ok) {
@@ -40,19 +47,17 @@ export async function getMembers(): Promise<Member[]> {
     const data = await response.json();
     const rows: string[][] = data.values || [];
 
-    // Заголовок окремо не пропускаємо: якщо він є, його відсіє
-    // перевірка формату дати (parseBirthday поверне null)
+    // Заголовок відсіюється сам: parseBirthday повертає null для не-дат
     for (const row of rows) {
-        const rawName = row[1] || '';       // Ім'я
-        const rawStatus = row[2] || '';     // Статус
-        const rawBirthday = row[3] || '';   // День народження
-        const rawUsername = row[4] || '';   // Нікнейм
-        const cleanUsername = rawUsername.trim().replace(/^@/, '');
+        const rawName = row[1] || '';
+        const rawStatus = row[2] || '';
+        const rawBirthday = row[3] || '';
+        const rawUsername = row[4] || '';
 
         if (rawName.trim() && parseBirthday(rawBirthday)) {
             members.push({
                 name: rawName.trim(),
-                username: cleanUsername,
+                username: rawUsername.trim().replace(/^@/, ''),
                 birthday: rawBirthday.trim(),
                 status: rawStatus.trim(),
             });
@@ -71,13 +76,13 @@ function parseBirthday(birthday: string): { day: number; month: number } | null 
     let month: number;
 
     if (value.includes('-')) {
-        // Формат YYYY-MM-DD
+        // YYYY-MM-DD
         const parts = value.split('-');
         if (parts.length < 3) return null;
         month = parseInt(parts[1], 10);
         day = parseInt(parts[2], 10);
     } else if (value.includes('.')) {
-        // Формат DD.MM.YYYY або DD.MM
+        // DD.MM.YYYY або DD.MM
         const parts = value.split('.');
         if (parts.length < 2) return null;
         day = parseInt(parts[0], 10);
@@ -114,7 +119,7 @@ export function getTodaysBirthdays(members: Member[]): Member[] {
         (currentYear % 4 === 0 && currentYear % 100 !== 0) || currentYear % 400 === 0;
 
     return members.filter(member => {
-        // Фільтр за статусом: вітаємо Active та Alumni
+        // Вітаємо лише Active та Alumni
         const status = member.status.toLowerCase();
         if (status !== 'active' && status !== 'alumni') return false;
 

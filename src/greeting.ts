@@ -1,6 +1,8 @@
 import { escapeHtml } from './telegram';
 import type { Member } from './sheets';
 
+const PLACEHOLDER = '[імʼя]';
+
 const GREETINGS = [
     "Настрою чумового, Свята тобі крутого, Любові до запаморочення, Вітаю [імʼя] з Днем Народження 🥂",
     "Усього келих за здоров'я [імʼя]! З днем народження 🍻",
@@ -13,31 +15,34 @@ const GREETINGS = [
     "З Днем народження [імʼя]! Мрій, люби і живи на повну! Нехай удача тобі посміхається кожну секунду 🚀",
     "Приправимо цей день радістю з нагоди дня народження [імʼя]. Удачі у всьому ✨",
     "Цього дня світ поповнився новою зіркою — [імʼя]. Наші найкращі побажання 🌠",
-    "[імʼя], сподіваюся, минулий рік був прекрасним, а майбутній буде тільки краще! Зі святом 🥳"
+    "[імʼя], сподіваюся, минулий рік був прекрасним, а майбутній буде тільки краще! Зі святом 🥳",
 ];
 
+// "Прізвище Ім'я По батькові" -> "Ім'я Прізвище"
+function displayName(fullName: string): string {
+    const parts = fullName.trim().split(/\s+/);
+    return parts.length >= 2 ? `${parts[1]} ${parts[0]}` : parts[0] ?? '';
+}
+
+// Ім'я жирним + @username для тегу (якщо нік є)
+function formatMember(member: Member): string {
+    const name = `<b>${escapeHtml(displayName(member.name))}</b>`;
+    const username = member.username.trim().replace(/^@/, '');
+    return username ? `${name} @${escapeHtml(username)}` : name;
+}
+
+// ["А"] -> "А"; ["А","Б"] -> "А та Б"; ["А","Б","В"] -> "А, Б та В"
+function joinNames(items: string[]): string {
+    if (items.length <= 1) return items[0] ?? '';
+    return `${items.slice(0, -1).join(', ')} та ${items[items.length - 1]}`;
+}
+
 export function buildGreeting(members: Member[]): string {
-    if (members.length === 0) {
-        return '';
-    }
+    if (members.length === 0) return '';
 
-    // Підстановка імені та @username (або тільки ПІБ)
-    const memberTags = members.map(member => {
-        const safeName = escapeHtml(member.name);
-        if (member.username) {
-            const safeUsername = escapeHtml(member.username);
-            return `<b>${safeName}</b> @${safeUsername}`;
-        } else {
-            return `<b>${safeName}</b>`;
-        }
-    });
+    const names = joinNames(members.map(formatMember));
+    const template = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
 
-    // Спільний пост: об'єднуємо всіх іменинників через кому
-    const namesString = memberTags.join(', ');
-
-    // Вибір шаблону через Math.random
-    const randomIndex = Math.floor(Math.random() * GREETINGS.length);
-    const randomGreeting = GREETINGS[randomIndex];
-
-    return randomGreeting.replace(/[імʼя]/g, namesString);
+    // Буквальна заміна: без regex, а функція захищає від спецпослідовностей на кшталт $&
+    return template.replaceAll(PLACEHOLDER, () => names);
 }

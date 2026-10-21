@@ -14,10 +14,20 @@ function kyivHour(): number {
   );
 }
 
+// Where this run came from (for logs and error reports)
+function runSource(): string {
+  return process.env.GITHUB_RUN_ID
+    ? `GitHub Actions, подія: ${process.env.GITHUB_EVENT_NAME}, запуск: ${process.env.GITHUB_RUN_ID}`
+    : "локальний запуск";
+}
+
 // Check time -> find birthdays -> greet -> report to admins
 async function main(): Promise<void> {
+  const hour = kyivHour();
+  console.log(`Подія: ${process.env.GITHUB_EVENT_NAME ?? "local"}, година в Києві: ${hour}`);
+
   // Two crons cover DST, so only run at 09:00 Kyiv time
-  if (!config.forceRun && kyivHour() !== 9) {
+  if (!config.forceRun && hour !== 9) {
     console.log("Зараз не 09:00 за Києвом, нічого не робимо.");
     return;
   }
@@ -38,6 +48,8 @@ async function main(): Promise<void> {
 main().catch(async (e) => {
   console.error(e);
   const message = e instanceof Error ? e.message : String(e);
-  await sendToAdmins(`❌ Помилка бота:\n<code>${escapeHtml(message)}</code>`);
+  await sendToAdmins(
+    `❌ Помилка бота (${escapeHtml(runSource())}):\n<code>${escapeHtml(message)}</code>`,
+  ).catch(console.error);
   process.exit(1);
 });
