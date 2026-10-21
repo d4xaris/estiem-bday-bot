@@ -20,3 +20,4 @@ jobs:
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
