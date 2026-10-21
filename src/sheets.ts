@@ -18,8 +18,13 @@ export async function getMembers(): Promise<Member[]> {
     });
 
     const accessToken = await auth.getAccessToken();
+    if (!accessToken) {
+        throw new Error('Не вдалося отримати access token для сервісного акаунта');
+    }
 
-    // Завантаження даних із діапазону A:E
+    // Діапазон A:E, щоб індекси відповідали колонкам:
+    // row[0] = A (порожня), row[1] = B (ім'я), row[2] = C (статус),
+    // row[3] = D (дата народження), row[4] = E (нікнейм)
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.sheetId}/values/A:E`;
     const response = await fetch(url, {
         headers: {
@@ -28,19 +33,20 @@ export async function getMembers(): Promise<Member[]> {
     });
 
     if (!response.ok) {
-        throw new Error(`Помилка отримання таблиці: ${response.statusText}`);
+        const body = await response.text();
+        throw new Error(`Помилка отримання таблиці: ${response.status} ${body}`);
     }
 
     const data = await response.json();
-    const rows = data.values || [];
+    const rows: string[][] = data.values || [];
 
-    // Обробка рядків
-    for (const row of rows.slice(1)) {
-        for (const row of rows.slice(1)) {
-            const rawName = row[1] || '';       // Ім'я
-            const rawStatus = row[2] || '';     // Статус
-            const rawBirthday = row[3] || '';   // День народження
-            const rawUsername = row[4] || '';
+    // Заголовок окремо не пропускаємо: якщо він є, його відсіє
+    // перевірка формату дати (parseBirthday поверне null)
+    for (const row of rows) {
+        const rawName = row[1] || '';       // Ім'я
+        const rawStatus = row[2] || '';     // Статус
+        const rawBirthday = row[3] || '';   // День народження
+        const rawUsername = row[4] || '';   // Нікнейм
         const cleanUsername = rawUsername.trim().replace(/^@/, '');
 
             if (rawName && rawBirthday) {
@@ -53,47 +59,71 @@ export async function getMembers(): Promise<Member[]> {
             }
         }
 
-        return members;
-    }
-
     return members;
 }
 
-export function getTodaysBirthdays(members: Member[]): Member[] {
-    const kyivDate = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Kyiv" }));
-    const currentMonth = kyivDate.getMonth() + 1;
-    const currentDay = kyivDate.getDate();
-    const currentYear = kyivDate.getFullYear();
+// Повертає день і місяць народження або null, якщо формат невідомий
+function parseBirthday(birthday: string): { day: number; month: number } | null {
+    const value = birthday.trim();
+    if (!value) return null;
 
-    const isLeapYear = (currentYear % 4 === 0 && currentYear % 100 !== 0) || (currentYear % 400 === 0);
+    let day: number;
+    let month: number;
+
+    if (value.includes('-')) {
+        // Формат YYYY-MM-DD
+        const parts = value.split('-');
+        if (parts.length < 3) return null;
+        month = parseInt(parts[1], 10);
+        day = parseInt(parts[2], 10);
+    } else if (value.includes('.')) {
+        // Формат DD.MM.YYYY або DD.MM
+        const parts = value.split('.');
+        if (parts.length < 2) return null;
+        day = parseInt(parts[0], 10);
+        month = parseInt(parts[1], 10);
+    } else {
+        return null;
+    }
+
+    if (isNaN(day) || isNaN(month)) return null;
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+    return { day, month };
+}
+
+// Поточна дата за київським часом (незалежно від часового поясу сервера)
+function getKyivDateParts(): { day: number; month: number; year: number } {
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Europe/Kyiv',
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+    }).formatToParts(new Date());
+
+    const get = (type: string) =>
+        parseInt(parts.find(p => p.type === type)!.value, 10);
+
+    return { day: get('day'), month: get('month'), year: get('year') };
+}
+
+export function getTodaysBirthdays(members: Member[]): Member[] {
+    const { day: currentDay, month: currentMonth, year: currentYear } = getKyivDateParts();
+
+    const isLeapYear =
+        (currentYear % 4 === 0 && currentYear % 100 !== 0) || currentYear % 400 === 0;
 
     return members.filter(member => {
-        if (!member.birthday) return false;
-
         // Фільтр за статусом: вітаємо Active та Alumni
         const status = member.status.toLowerCase();
         if (status !== 'active' && status !== 'alumni') return false;
 
-        let bDay: number;
-        let bMonth: number;
+        const parsed = parseBirthday(member.birthday);
+        if (!parsed) return false;
 
-        // Перевіряємо, в якому форматі записана дата
-        if (member.birthday.includes('-')) {
-            // Формат YYYY-MM-DD
-            const parts = member.birthday.split('-');
-            if (parts.length < 3) return false;
-            bMonth = parseInt(parts[1], 10);
-            bDay = parseInt(parts[2], 10);
-        } else if (member.birthday.includes('.')) {
-            // Формат DD.MM.YYYY або DD.MM
-            const parts = member.birthday.split('.');
-            if (parts.length < 2) return false;
-            bDay = parseInt(parts[0], 10);
-            bMonth = parseInt(parts[1], 10);
-        } else {
-            return false;
-        }
-        // 29 лютого (не високосний рік) привітання 1 березня
+        const { day: bDay, month: bMonth } = parsed;
+
+        // 29 лютого (не високосний рік): вітаємо 1 березня
         if (!isLeapYear && currentMonth === 3 && currentDay === 1 && bMonth === 2 && bDay === 29) {
             return true;
         }
