@@ -1,16 +1,35 @@
 name: Daily birthdays
 
 on:
+  # Primary trigger: external scheduler (cron-job.org) calls the dispatch API at 09:00 Kyiv.
+  # GitHub cron below is only a fallback in case the external trigger fails;
+  # it can be delayed by hours, and the .sent marker prevents duplicates.
   schedule:
-    - cron: "0 6 * * *" # 09:00 Київ влітку (UTC+3)
-    - cron: "0 7 * * *" # 09:00 Київ взимку (UTC+2)
+    - cron: "7 6 * * *" # ~09:07 Київ влітку (UTC+3)
+    - cron: "7 7 * * *" # ~09:07 Київ взимку (UTC+2)
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Ігнорувати перевірку часу й «вже надіслано» (для ручного запуску)"
+        type: boolean
+        default: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Today's date in Kyiv, used as the cache key for the "already sent" marker
+      - id: date
+        run: echo "d=$(TZ=Europe/Kyiv date +%F)" >> "$GITHUB_OUTPUT"
+
+      # Restores .sent if a previous run today succeeded; saves it at the end of this job
+      - uses: actions/cache@v4
+        with:
+          path: .sent
+          key: sent-${{ steps.date.outputs.d }}
+
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bun run src/index.ts
@@ -20,4 +39,5 @@ jobs:
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          # Forced only for manual dispatch with force=true; the external 09:00 trigger sends force=false
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force == 'true' }}
