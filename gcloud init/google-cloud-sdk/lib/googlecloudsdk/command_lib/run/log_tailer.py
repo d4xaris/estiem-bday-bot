@@ -1,0 +1,217 @@
+# -*- coding: utf-8 -*- #
+# Copyright 2026 Google LLC. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Helper class to stream/tail logs for Cloud Run."""
+
+import json
+import re
+import subprocess
+import sys
+import threading
+from typing import Optional
+
+from googlecloudsdk.core import log
+
+TAIL_LOGS_BIN = '/usr/local/gcp/bin/tail_logs'
+UNSUPPORTED_LIB = '/lib64/ld-linux-x86-64.so.2'
+LOG_TAILING_NOT_SUPPORTED_MSG = (
+    'Failed to stream logs: Log tailing is not supported for this instance'
+)
+
+_IGNORED_METADATA_PREFIXES = (
+    'Project:',
+    'Region:',
+    'Instance:',
+    'Revision:',
+    'Container:',
+    'Image:',
+)
+
+_CONTAINER_STREAM_LOG_NAMES = (
+    '[stdout_stderr]',
+    '[stdout]',
+    '[stderr]',
+)
+
+_SEVERITIES = (
+    'DEFAULT',
+    'DEBUG',
+    'INFO',
+    'NOTICE',
+    'WARNING',
+    'ERROR',
+    'CRITICAL',
+    'ALERT',
+    'EMERGENCY',
+)
+
+_SEVERITIES_PATTERN = '|'.join(_SEVERITIES)
+
+_LOG_LINE_PATTERN = re.compile(
+    r'^(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\])\s+'
+    rf'(?:\[({_SEVERITIES_PATTERN})\]\s+)?'
+    r'(\[[^\]]+\])\s*(.*)$'
+)
+
+
+def _GetExplicitSeverity(payload: str) -> Optional[str]:
+  """Returns explicit severity if payload is a structured JSON log entry."""
+  stripped = payload.strip()
+  if not (stripped.startswith('{') and stripped.endswith('}')):
+    return None
+  try:
+    data = json.loads(stripped)
+    if isinstance(data, dict):
+      for key in ('severity', 'level'):
+        val = data.get(key)
+        if isinstance(val, str) and val.upper() in _SEVERITIES:
+          return val.upper()
+  except (ValueError, TypeError):
+    pass
+  return None
+
+
+def FormatLogLineForDevSync(line: str) -> str:
+  """Formats a log entry for dev sync, omitting timestamps and stream names."""
+  match = _LOG_LINE_PATTERN.match(line)
+  if not match:
+    return line
+  _, severity, source, payload = (
+      match.group(1),
+      match.group(2),
+      match.group(3),
+      match.group(4),
+  )
+  final_severity = None
+  explicit_sev = _GetExplicitSeverity(payload)
+  if explicit_sev:
+    final_severity = explicit_sev
+  elif severity and source not in _CONTAINER_STREAM_LOG_NAMES:
+    final_severity = severity
+
+  if final_severity:
+    return f'[{final_severity}] {payload}\n'
+  return f'{payload}\n'
+
+
+def FormatLogLineForTail(line: str) -> str:
+  """Formats a log entry for tailing, preserving timestamps and streams."""
+  match = _LOG_LINE_PATTERN.match(line)
+  if not match:
+    return line
+  timestamp, severity, source, payload = (
+      match.group(1),
+      match.group(2),
+      match.group(3),
+      match.group(4),
+  )
+  final_severity = None
+  explicit_sev = _GetExplicitSeverity(payload)
+  if explicit_sev:
+    final_severity = explicit_sev
+  elif severity and source not in _CONTAINER_STREAM_LOG_NAMES:
+    final_severity = severity
+
+  if final_severity:
+    return f'{timestamp} [{final_severity}] {source} {payload}\n'
+  return f'{timestamp} {source} {payload}\n'
+
+
+def IsUnsupportedLogTailingError(line: str) -> bool:
+  """Returns True if the line indicates log tailing is not supported."""
+  line_lower = line.lower()
+  has_bin = (
+      TAIL_LOGS_BIN.lower() in line_lower
+      or UNSUPPORTED_LIB.lower() in line_lower
+  )
+  has_not_found = (
+      'no such file or directory' in line_lower or 'not found' in line_lower
+  )
+  return has_bin and has_not_found
+
+
+class LogTailer:
+  """Helper class to tail logs from a Cloud Run instance concurrently."""
+
+  def __init__(self, ssh_session):
+    self._ssh_session = ssh_session
+    self._process = None
+    self._thread = None
+
+  def _FilterAndStream(self):
+    """Filters metadata header lines and streams container log output."""
+    if not self._process or not self._process.stdout:
+      return
+
+    try:
+      for line in iter(self._process.stdout.readline, ''):
+        if any(
+            line.startswith(prefix) for prefix in _IGNORED_METADATA_PREFIXES
+        ):
+          continue
+        if IsUnsupportedLogTailingError(line):
+          log.error(LOG_TAILING_NOT_SUPPORTED_MSG)
+          return
+        line = FormatLogLineForDevSync(line)
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except Exception as e:  # pylint: disable=broad-except
+      log.debug('Error in log tailer streaming thread: %s', e)
+
+  def Start(self):
+    """Starts the log tailing process in the background."""
+    if self._process is not None:
+      return
+
+    try:
+      ssh_cmd = self._ssh_session.GetSshCommand(
+          remote_command=[
+              UNSUPPORTED_LIB,
+              TAIL_LOGS_BIN,
+          ]
+      )
+
+      cmd = ssh_cmd.Build(self._ssh_session.env)
+      self._process = subprocess.Popen(
+          cmd,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.STDOUT,
+          text=True,
+          bufsize=1,
+      )
+      self._thread = threading.Thread(
+          target=self._FilterAndStream,
+          daemon=True,
+      )
+      self._thread.start()
+      log.debug('Started log tailing process PID %s', self._process.pid)
+    except Exception as e:  # pylint: disable=broad-except
+      log.warning('Failed to start log tailing: %s', e)
+      self._process = None
+      self._thread = None
+
+  def Stop(self):
+    """Stops the log tailing process if running."""
+    if self._process is None:
+      return
+
+    try:
+      log.debug('Stopping log tailing process PID %s', self._process.pid)
+      self._process.terminate()
+      self._process.wait(timeout=3)
+    except Exception as e:  # pylint: disable=broad-except
+      log.debug('Error stopping log tailing process: %s', e)
+    finally:
+      self._process = None
+      self._thread = None

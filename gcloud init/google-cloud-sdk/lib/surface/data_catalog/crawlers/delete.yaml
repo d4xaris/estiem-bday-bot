@@ -1,0 +1,15 @@
+- release_tracks: [ALPHA]
+  hints:
+    read_only: false
+  help_text:
+    brief: Delete a Data Catalog crawler.
+    description: Delete a Data Catalog crawler.
+
+  request:
+    collection: datacatalog.projects.crawlers
+    api_version: v1alpha3
+
+  arguments:
+    resource:
+      help_text: The crawler to delete.
+      spec: !REF googlecloudsdk.command_lib.data_catalog.resources:crawler

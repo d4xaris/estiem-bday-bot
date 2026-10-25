@@ -1,0 +1,208 @@
+# -*- coding: utf-8 -*- #
+# Copyright 2026 Google LLC. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Translation rule for networking features."""
+
+from collections.abc import Mapping, Sequence
+import json
+import logging
+from typing import Any
+
+_EGRESS_SETTING_MAPPING = {
+    'ALL_TRAFFIC': 'all-traffic',
+    'PRIVATE_IP_RANGES': 'private-ranges-only',
+    'EGRESS_SETTING_UNSPECIFIED': 'private-ranges-only',
+    'all-traffic': 'all-traffic',
+    'private-ranges-only': 'private-ranges-only',
+}
+
+
+def map_vpc_egress_setting(egress_setting: str | None) -> str | None:
+  """Maps App Engine Admin API VPC egress setting to Cloud Run accepted values.
+
+  Args:
+    egress_setting: The egress setting string from App Engine config or Admin
+      API.
+
+  Returns:
+    The mapped Cloud Run egress value, or the original value if unmapped.
+  """
+  if egress_setting is None:
+    return None
+  return _EGRESS_SETTING_MAPPING.get(egress_setting, egress_setting)
+
+
+def _warn_if_multiple_forwarded_ports(forwarded_ports: Any) -> None:
+  """Warns that only the first port is configured if multiple are specified.
+
+  Args:
+    forwarded_ports: The value of the forwarded ports field from the input data.
+  """
+  if isinstance(forwarded_ports, list) and len(forwarded_ports) > 1:
+    logging.warning(
+        'Multiple forwarded ports specified: %s. Cloud Run only supports a'
+        ' single container port per service. Configuring port %s;'
+        ' additional ports are ignored.',
+        forwarded_ports,
+        forwarded_ports[0],
+    )
+
+
+def translate_network_features(
+    input_data: Mapping[str, Any],
+) -> Sequence[str]:
+  """Translate networking features.
+
+  Args:
+    input_data: Flattened dictionary of the parsed app.yaml file.
+
+  Returns:
+    A list of strings representing the flags for Cloud Run.
+  """
+  output_flags = []
+  if 'network.name' in input_data:
+    output_flags.append(f'--network={input_data["network.name"]}')
+  if 'network.subnetwork_name' in input_data:
+    output_flags.append(f'--subnet={input_data["network.subnetwork_name"]}')
+  if 'network.instance_tag' in input_data:
+    output_flags.append(f'--network-tags={input_data["network.instance_tag"]}')
+  if input_data.get('network.session_affinity'):
+    output_flags.append('--session-affinity')
+
+  forwarded_ports = input_data.get('network.forwarded_ports') or input_data.get(
+      'network.forwardedPorts'
+  )
+  if forwarded_ports:
+    _warn_if_multiple_forwarded_ports(forwarded_ports)
+    output_flags.append(f'--port={forwarded_ports[0]}')
+
+  instance_ip_mode = input_data.get(
+      'network.instance_ip_mode'
+  ) or input_data.get('network.instanceIpMode')
+  has_direct_vpc = bool(
+      input_data.get('network.name')
+      or input_data.get('network.subnetwork_name')
+  )
+  # Flex VMs without an external IP send all outbound traffic through the VPC.
+  if instance_ip_mode and instance_ip_mode.lower() == 'internal':
+    if has_direct_vpc:
+      output_flags.append('--vpc-egress=all-traffic')
+    else:
+      logging.warning(
+          'App Engine Flexible instance_ip_mode is internal, but no Direct VPC'
+          ' network or subnetwork is configured. VPC egress cannot be set.'
+      )
+
+  return output_flags
+
+
+def update_service_yaml_with_network(
+    service_yaml: dict[str, Any],
+    input_data: Mapping[str, Any],
+) -> None:
+  """Update the service_yaml dict with networking settings.
+
+  Args:
+    service_yaml: The dictionary representation of the Cloud Run service YAML to
+      be updated.
+    input_data: Flattened dictionary of the parsed app.yaml file, containing
+      networking configurations.
+  """
+
+  # 1. Service level annotations
+  service_yaml.setdefault('metadata', {}).setdefault('annotations', {})
+
+  # 2. Revision level metadata & annotations
+  spec = service_yaml.setdefault('spec', {})
+  template = spec.setdefault('template', {})
+  template_metadata = template.setdefault('metadata', {})
+  template_annotations = template_metadata.setdefault('annotations', {})
+
+  if input_data.get('network.session_affinity'):
+    template_annotations['run.googleapis.com/sessionAffinity'] = 'true'
+
+  # 3. Direct VPC (Network, Subnet, and Tags)
+  network_interface = {}
+  if network_name := input_data.get('network.name'):
+    network_interface['network'] = network_name
+  if subnetwork_name := input_data.get(
+      'network.subnetwork_name'
+  ) or input_data.get('network.subnetworkName'):
+    network_interface['subnetwork'] = subnetwork_name
+  if tag_data := input_data.get('network.instance_tag') or input_data.get(
+      'network.instanceTag'
+  ):
+    network_interface['tags'] = (
+        tag_data if isinstance(tag_data, list) else [tag_data]
+    )
+
+  instance_ip_mode = input_data.get(
+      'network.instance_ip_mode'
+  ) or input_data.get('network.instanceIpMode')
+  has_direct_vpc = bool(network_name or subnetwork_name)
+
+  if network_interface:
+    template_annotations['run.googleapis.com/network-interfaces'] = json.dumps(
+        [network_interface]
+    )
+
+  # Flex VMs without an external IP send all outbound traffic through the VPC.
+  if instance_ip_mode and instance_ip_mode.lower() == 'internal':
+    if has_direct_vpc:
+      # gcloud-disable-gdu-domain
+      template_annotations['run.googleapis.com/vpc-access-egress'] = (
+          'all-traffic'
+      )
+    else:
+      logging.warning(
+          'App Engine Flexible instance_ip_mode is internal, but no Direct VPC'
+          ' network or subnetwork is configured. VPC egress cannot be set.'
+      )
+
+  vpc_connector = input_data.get('vpc_access_connector.name') or input_data.get(
+      'vpcAccessConnector.name'
+  )
+  if network_interface and vpc_connector:
+    logging.warning(
+        'Both Direct VPC and VPC Access Connector are specified; Cloud Run does'
+        ' not support both simultaneously. Prioritizing Direct VPC and'
+        ' ignoring VPC Access Connector.'
+    )
+  elif vpc_connector:
+    template_annotations['run.googleapis.com/vpc-access-connector'] = (
+        vpc_connector
+    )
+
+    vpc_egress = input_data.get(
+        'vpc_access_connector.egress_setting'
+    ) or input_data.get('vpcAccessConnector.egressSetting')
+    if vpc_egress:
+      # gcloud-disable-gdu-domain
+      template_annotations['run.googleapis.com/vpc-access-egress'] = (
+          map_vpc_egress_setting(vpc_egress)
+      )
+
+  # 4. Container level settings
+  template_spec = template.setdefault('spec', {})
+  containers = template_spec.setdefault('containers', [{}])
+  container = containers[0]
+
+  forwarded_ports = input_data.get('network.forwarded_ports') or input_data.get(
+      'network.forwardedPorts'
+  )
+  if forwarded_ports:
+    _warn_if_multiple_forwarded_ports(forwarded_ports)
+    container_ports = container.setdefault('ports', [])
+    container_ports.append({'containerPort': int(forwarded_ports[0])})

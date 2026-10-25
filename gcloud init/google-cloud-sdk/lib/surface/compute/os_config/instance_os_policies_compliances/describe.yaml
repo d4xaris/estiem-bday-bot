@@ -1,0 +1,38 @@
+- release_tracks: [ALPHA]
+  hints:
+    read_only: true
+
+  help_text:
+    brief: Describe the compliance states for OS policies that are applied to a VM.
+    description: |
+      Describe the compliance states for OS policies that are applied to a VM.
+    examples: |
+      To report the compliance state of an instance `my-instance`
+      that has the instance ID `5678` in the current project
+      and location `us-central1-a`, run:
+
+      $ {command} 5678 --location=us-central1-a
+
+  request:
+    collection: osconfig.projects.locations.instanceOSPoliciesCompliances
+    regional_endpoint_compatibility: SUPPORTED
+    ALPHA:
+      api_version: v1alpha
+
+  arguments:
+    resource:
+      help_text: Compute Engine VM instance whose OS policies compliance state to describe.
+      spec: !REF googlecloudsdk.command_lib.compute.os_config.resources:instance_os_policies_compliance
+
+  output:
+    format: |
+      default(
+        detailedState,
+        detailedStateReason,
+        instance,
+        lastComplianceCheckTime.date("%Y-%m-%dT%H:%M:%SZ"),
+        lastComplianceRunId,
+        name,
+        osPolicyCompliances,
+        state
+      )

@@ -1,0 +1,248 @@
+# -*- coding: utf-8 -*- #
+# Copyright 2019 Google LLC. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Command to PATCH-style update autoscaling for a managed instance group."""
+
+from googlecloudsdk.api_lib.compute import base_classes
+from googlecloudsdk.api_lib.compute import managed_instance_groups_utils as mig_utils
+from googlecloudsdk.api_lib.compute.instance_groups.managed import autoscalers as autoscalers_api
+from googlecloudsdk.calliope import arg_parsers
+from googlecloudsdk.calliope import base
+from googlecloudsdk.command_lib.compute.instance_groups import flags as instance_groups_flags
+from googlecloudsdk.command_lib.util.apis import arg_utils
+from googlecloudsdk.core import exceptions
+
+
+def _CommonArgs(parser):
+  """Helper function for defining common arguments."""
+
+  instance_groups_flags.MULTISCOPE_INSTANCE_GROUP_MANAGER_ARG.AddArgument(
+      parser
+  )
+  mig_utils.GetModeFlag().AddToParser(parser)
+  mig_utils.AddScaleInControlFlag(parser, include_clear=True)
+  mig_utils.AddMinMaxControl(parser, max_required=False)
+  parser.add_argument(
+      '--stabilization-period',
+      type=arg_parsers.Duration(),
+      help=(
+          'The number of seconds that the autoscaler waits for load'
+          ' stabilization before making scale-in decisions. For more'
+          ' information, see [stabilization'
+          ' period](https://cloud.google.com/compute/docs/autoscaler#stabilization_period).'
+      ),
+  )
+  mig_utils.AddScheduledAutoscaling(parser, patch_args=True)
+
+
+class NoMatchingAutoscalerFoundError(exceptions.Error):
+  pass
+
+
+@base.ReleaseTracks(base.ReleaseTrack.GA)
+@base.UniverseCompatible
+class UpdateAutoscaling(base.Command):
+  """Update autoscaling parameters of a managed instance group."""
+
+  clear_scale_down = False
+  _support_cpu_range = False
+
+  @classmethod
+  def Args(cls, parser):
+    _CommonArgs(parser)
+    mutex_group = parser.add_group(mutex=True)
+    if cls._support_cpu_range:
+      mig_utils.AddCpuUtilizationRangeFlags(mutex_group, include_clear=True)
+    mig_utils.AddPredictiveAutoscaling(mutex_group, standard=False)
+
+  def Run(self, args):
+    holder = base_classes.ComputeApiHolder(self.ReleaseTrack())
+    client = holder.client
+    mig_utils.ValidateCpuAggregationArgs(args)
+    mig_utils.ValidateCpuUtilizationRangeArgs(args)
+    igm_ref = instance_groups_flags.CreateGroupReference(
+        client, holder.resources, args
+    )
+
+    # Assert that Instance Group Manager exists.
+    mig_utils.GetInstanceGroupManagerOrThrow(igm_ref, client)
+
+    old_autoscaler = mig_utils.AutoscalerForMigByRef(
+        client, holder.resources, igm_ref
+    )
+    if mig_utils.IsAutoscalerNew(old_autoscaler):
+      raise NoMatchingAutoscalerFoundError(
+          'Instance group manager [{}] has no existing autoscaler; '
+          'cannot update.'.format(igm_ref.Name())
+      )
+
+    autoscalers_client = autoscalers_api.GetClient(client, igm_ref)
+    new_autoscaler = autoscalers_client.message_type(
+        name=old_autoscaler.name,  # PATCH needs this
+        autoscalingPolicy=client.messages.AutoscalingPolicy(),
+    )
+    if args.IsSpecified('mode'):
+      mode = mig_utils.ParseModeString(args.mode, client.messages)
+      new_autoscaler.autoscalingPolicy.mode = mode
+
+    if args.IsSpecified('clear_scale_in_control'):
+      new_autoscaler.autoscalingPolicy.scaleInControl = None
+    else:
+      new_autoscaler.autoscalingPolicy.scaleInControl = mig_utils.BuildScaleIn(
+          args, client.messages
+      )
+
+    if self.clear_scale_down and args.IsSpecified('clear_scale_down_control'):
+      new_autoscaler.autoscalingPolicy.scaleDownControl = None
+
+    if (
+        args.IsKnownAndSpecified('cpu_utilization_predictive_method')
+        or args.IsKnownAndSpecified('cpu_time_aggregation')
+        or args.IsKnownAndSpecified('cpu_signal_aggregation')
+        or args.IsKnownAndSpecified('min_cpu_utilization')
+        or args.IsKnownAndSpecified('max_cpu_utilization')
+        or args.IsKnownAndSpecified('clear_cpu_range_boundaries')
+    ):
+      cpu_message = client.messages.AutoscalingPolicyCpuUtilization()
+      if args.IsKnownAndSpecified('clear_cpu_range_boundaries'):
+        cpu_message.utilizationMin = None
+        cpu_message.utilizationMax = None
+      else:
+        if args.IsKnownAndSpecified('min_cpu_utilization'):
+          cpu_message.utilizationMin = args.min_cpu_utilization
+        if args.IsKnownAndSpecified('max_cpu_utilization'):
+          cpu_message.utilizationMax = args.max_cpu_utilization
+      if args.IsKnownAndSpecified('cpu_utilization_predictive_method'):
+        cpu_predictive_enum = (
+            client.messages.AutoscalingPolicyCpuUtilization.PredictiveMethodValueValuesEnum
+        )
+        cpu_message.predictiveMethod = arg_utils.ChoiceToEnum(
+            args.cpu_utilization_predictive_method, cpu_predictive_enum
+        )
+      if args.IsKnownAndSpecified('cpu_time_aggregation'):
+        cpu_message.timeAggregation = mig_utils.BuildCpuTimeAggregation(
+            args, client.messages
+        )
+      if args.IsKnownAndSpecified('cpu_signal_aggregation'):
+        cpu_message.signalAggregation = mig_utils.BuildCpuSignalAggregation(
+            args, client.messages
+        )
+      new_autoscaler.autoscalingPolicy.cpuUtilization = cpu_message
+
+    scheduled = mig_utils.BuildSchedules(args, client.messages)
+    if scheduled:
+      new_autoscaler.autoscalingPolicy.scalingSchedules = scheduled
+
+    if args.IsSpecified('min_num_replicas'):
+      new_autoscaler.autoscalingPolicy.minNumReplicas = args.min_num_replicas
+    if args.IsSpecified('max_num_replicas'):
+      new_autoscaler.autoscalingPolicy.maxNumReplicas = args.max_num_replicas
+    if args.IsSpecified('stabilization_period'):
+      new_autoscaler.autoscalingPolicy.stabilizationPeriodSec = (
+          args.stabilization_period
+      )
+
+    return self._SendPatchRequest(
+        args, client, autoscalers_client, igm_ref, new_autoscaler
+    )
+
+  def _SendPatchRequest(
+      self, args, client, autoscalers_client, igm_ref, new_autoscaler
+  ):
+    # Apitools won't send null fields unless explicitly told to.
+    include_fields = []
+    if args.IsSpecified('clear_scale_in_control'):
+      include_fields.append('autoscalingPolicy.scaleInControl')
+    if self.clear_scale_down and args.IsSpecified('clear_scale_down_control'):
+      include_fields.append('autoscalingPolicy.scaleDownControl')
+    if args.IsKnownAndSpecified('clear_cpu_range_boundaries'):
+      include_fields.extend([
+          'autoscalingPolicy.cpuUtilization.utilizationMin',
+          'autoscalingPolicy.cpuUtilization.utilizationMax',
+      ])
+
+    if include_fields:
+      with client.apitools_client.IncludeFields(include_fields):
+        return autoscalers_client.Patch(igm_ref, new_autoscaler)
+    return autoscalers_client.Patch(igm_ref, new_autoscaler)
+
+
+@base.ReleaseTracks(base.ReleaseTrack.PREVIEW)
+@base.UniverseCompatible
+class UpdateAutoscalingPreview(UpdateAutoscaling):
+  """Update autoscaling parameters of a managed instance group."""
+
+  _support_cpu_range = True
+
+
+@base.ReleaseTracks(base.ReleaseTrack.BETA)
+class UpdateAutoscalingBeta(UpdateAutoscaling):
+  """Update autoscaling parameters of a managed instance group."""
+
+  clear_scale_down = True
+
+  @staticmethod
+  def Args(parser):
+    _CommonArgs(parser)
+    mutex_group = parser.add_group(mutex=True)
+    mig_utils.AddPredictiveAutoscaling(mutex_group, standard=False)
+    mig_utils.AddClearScaleDownControlFlag(parser)
+
+
+@base.ReleaseTracks(base.ReleaseTrack.ALPHA)
+class UpdateAutoscalingAlpha(UpdateAutoscalingBeta):
+  """Update autoscaling parameters of a managed instance group."""
+
+  clear_scale_down = True
+
+  @staticmethod
+  def Args(parser):
+    _CommonArgs(parser)
+    mutex_group = parser.add_group(mutex=True)
+    mig_utils.AddCpuUtilizationRangeFlags(mutex_group, include_clear=True)
+    mig_utils.AddPredictiveAutoscaling(mutex_group)
+    mig_utils.AddClearScaleDownControlFlag(parser)
+    mig_utils.AddCpuAggregationArgs(parser)
+
+
+UpdateAutoscaling.detailed_help = {
+    'brief': 'Update autoscaling parameters of a managed instance group',
+    'EXAMPLES': (
+        """\
+        To update an existing instance group:
+
+            $ {command} --mode=only-scale-out
+
+        """
+    ),
+    'DESCRIPTION': (
+        """
+*{command}* updates autoscaling parameters of specified managed instance
+group.
+
+Autoscalers can use one or more autoscaling signals. Information on using
+multiple autoscaling signals can be found here: [](https://cloud.google.com/compute/docs/autoscaler/multiple-signals)
+
+In contrast to *{parent_command} set-autoscaling*, this command *only* updates
+specified fields. For instance:
+
+    $ {command} --mode only-scale-out
+
+would change the *mode* field of the autoscaler policy, but leave the rest of
+the settings intact.
+        """
+    ),
+}
+UpdateAutoscalingAlpha.detailed_help = UpdateAutoscaling.detailed_help
+UpdateAutoscalingBeta.detailed_help = UpdateAutoscaling.detailed_help

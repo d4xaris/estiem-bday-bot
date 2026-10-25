@@ -1,5 +1,5 @@
 import { config } from "./config";
-import { getMembers, getTodaysBirthdays } from "./sheets";
+import { getMembers, getTodaysBirthdays, getGreetingsFromSheet } from "./sheets";
 import { buildGreeting } from "./greeting";
 import { sendToChat, sendToAdmins, escapeHtml } from "./telegram";
 
@@ -28,7 +28,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  await sendToChat(buildGreeting(birthdays));
+  // Завантажуємо таблицю з привітаннями та картинками
+  const customGreetings = await getGreetingsFromSheet();
+
+  // Генеруємо фінальний текст і картинку
+  const greetingData = buildGreeting(birthdays, customGreetings);
+
+  if (greetingData) {
+    // Відправляємо в чат і текст, і лінку на фото
+    await sendToChat(greetingData.text, greetingData.imageUrl);
+  }
   await sendToAdmins(
     `✅ Привітання надіслано: ${birthdays.map((m) => escapeHtml(m.name)).join(", ")}`,
   );
@@ -39,5 +48,6 @@ main().catch(async (e) => {
   console.error(e);
   const message = e instanceof Error ? e.message : String(e);
   await sendToAdmins(`❌ Помилка бота:\n<code>${escapeHtml(message)}</code>`);
+
   process.exit(1);
 });

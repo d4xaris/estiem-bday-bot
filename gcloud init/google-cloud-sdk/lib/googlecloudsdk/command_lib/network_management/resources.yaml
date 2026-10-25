@@ -1,0 +1,53 @@
+project:
+  name: project
+  collection: networkmanagement.projects
+  attributes:
+  - &project
+    parameter_name: projectsId
+    attribute_name: project
+    help: |
+      The project ID.
+    property: core/project
+
+connectivityTest:
+  name: connectivity test
+  collection: networkmanagement.projects.locations.global.connectivityTests
+  request_id_field: testId
+  attributes:
+  - *project
+  - &connectivityTest
+    parameter_name: connectivityTestsId
+    attribute_name: connectivity_test
+    help: ID of the connectivity test.
+
+operation:
+  name: operation
+  collection: networkmanagement.projects.locations.global.operations
+  attributes:
+  - *project
+  - &operation
+    parameter_name: operationsId
+    attribute_name: operation
+    help: The operation of Network Management resources.
+
+location:
+  name: location
+  collection: hstprof.projects.locations
+  attributes:
+  - *project
+  - &location
+    parameter_name: locationsId
+    attribute_name: location
+    help: The location of the {resource} resource.
+
+hstCollectionTask:
+  name: HST collection task
+  collection: hstprof.projects.locations.hstCollectionTasks
+  request_id_field: hstCollectionTaskId
+  attributes:
+  - *project
+  - *location
+  - &hstCollectionTask
+    parameter_name: hstCollectionTasksId
+    attribute_name: collection_task
+    help: ID of the HST collection task.
