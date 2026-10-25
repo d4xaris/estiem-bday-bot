@@ -1,5 +1,5 @@
-import { config } from './config';
 import { GoogleAuth } from 'google-auth-library';
+import { config } from './config';
 
 export interface Member {
     name: string;
@@ -25,8 +25,9 @@ async function getTokenWithRetry(auth: GoogleAuth, attempts = 3): Promise<string
 export async function getMembers(): Promise<Member[]> {
     const members: Member[] = [];
 
+    // Авторизація через локальний файл ключа (вирішує проблему Invalid JWT Signature)
     const auth = new GoogleAuth({
-        credentials: config.googleServiceAccount,
+        keyFile: 'service-account.json',
         scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     });
 
@@ -47,19 +48,19 @@ export async function getMembers(): Promise<Member[]> {
     const data = await response.json();
     const rows: string[][] = data.values || [];
 
-    // Заголовок відсіюється сам: parseBirthday повертає null для не-дат
+    // Обробка рядків таблиці
     for (const row of rows) {
         const rawName = row[1] || '';
         const rawStatus = row[2] || '';
         const rawBirthday = row[3] || '';
         const rawUsername = row[4] || '';
 
-        if (rawName.trim() && parseBirthday(rawBirthday)) {
+        if (rawName && rawBirthday) {
             members.push({
                 name: rawName.trim(),
                 username: rawUsername.trim().replace(/^@/, ''),
                 birthday: rawBirthday.trim(),
-                status: rawStatus.trim(),
+                status: rawStatus.trim()
             });
         }
     }
@@ -97,7 +98,7 @@ function parseBirthday(birthday: string): { day: number; month: number } | null 
     return { day, month };
 }
 
-// Поточна дата за київським часом (незалежно від часового поясу сервера)
+// Поточна дата за київським часом
 function getKyivDateParts(): { day: number; month: number; year: number } {
     const parts = new Intl.DateTimeFormat('en-US', {
         timeZone: 'Europe/Kyiv',
@@ -135,4 +136,50 @@ export function getTodaysBirthdays(members: Member[]): Member[] {
 
         return bDay === currentDay && bMonth === currentMonth;
     });
+}
+export interface GreetingRow {
+    text: string;
+    imageUrl: string;
+}
+
+export async function getGreetingsFromSheet(): Promise<GreetingRow[]> {
+    try {
+        const auth = new GoogleAuth({
+            keyFile: 'service-account.json',
+            scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+        });
+        const accessToken = await auth.getAccessToken();
+
+        // Забираємо дані з вкладки Greetings (колонки A та B)
+        const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.sheetId}/values/Greetings!A:B`;
+        const response = await fetch(url, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+        });
+
+        if (!response.ok) {
+            console.log("Вкладка Greetings недоступна. Використовуємо дефолтні привітання.");
+            return [];
+        }
+
+        const data = await response.json();
+        const rows: string[][] = data.values || [];
+
+        const greetings: GreetingRow[] = [];
+        // Пропускаємо перший рядок, бо там заголовки
+        for (const row of rows.slice(1)) {
+            const text = row[0] || '';
+            const imageUrl = row[1] || '';
+
+            if (text.trim()) {
+                greetings.push({
+                    text: text.trim(),
+                    imageUrl: imageUrl.trim()
+                });
+            }
+        }
+        return greetings;
+    } catch (error) {
+        console.error("Помилка завантаження привітань з таблиці:", error);
+        return [];
+    }
 }

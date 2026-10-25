@@ -1,0 +1,342 @@
+# -*- coding: utf-8 -*- #
+# Copyright 2026 Google LLC. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Command to Sync local workspace to a Cloud Run Instance."""
+
+import uuid
+
+from googlecloudsdk.api_lib.run import constants
+from googlecloudsdk.api_lib.run import container_resource
+from googlecloudsdk.api_lib.run import instance as instance_lib
+from googlecloudsdk.calliope import base
+from googlecloudsdk.command_lib.run import config_changes
+from googlecloudsdk.command_lib.run import connection_context
+from googlecloudsdk.command_lib.run import container_parser
+from googlecloudsdk.command_lib.run import deletion
+from googlecloudsdk.command_lib.run import exceptions
+from googlecloudsdk.command_lib.run import flags
+from googlecloudsdk.command_lib.run import pretty_print
+from googlecloudsdk.command_lib.run import proxy
+from googlecloudsdk.command_lib.run import resource_args
+from googlecloudsdk.command_lib.run import serverless_operations
+from googlecloudsdk.command_lib.run.sourcedeploys import deploy_util
+from googlecloudsdk.command_lib.run.sync import sync_util
+from googlecloudsdk.command_lib.util.args import map_util
+from googlecloudsdk.command_lib.util.concepts import concept_parsers
+from googlecloudsdk.command_lib.util.concepts import presentation_specs
+from googlecloudsdk.core import execution_utils
+from googlecloudsdk.core import log
+from googlecloudsdk.core import resources
+from googlecloudsdk.core.console import console_io
+
+_DEFAULT_PROXY_PORT = '8080'
+_NO_PROXY_HINT = 'Use --no-proxy to sync without starting a local proxy.'
+
+
+def ContainerArgGroup(release_track=base.ReleaseTrack.GA):
+  """Returns an argument group with all container deploy args."""
+
+  help_text = """
+Container Flags
+
+  The following flags apply to the container.
+"""
+  group = base.ArgumentGroup(help=help_text)
+  group.AddArgument(flags.SourceArg())
+  group.AddArgument(flags.PortArg())
+  group.AddArgument(flags.MutexBuildEnvVarsFlags())
+  group.AddArgument(flags.MutexEnvVarsFlags(release_track=release_track))
+  group.AddArgument(flags.MemoryFlag())
+  group.AddArgument(flags.CpuFlag())
+  group.AddArgument(flags.ArgsFlag())
+  group.AddArgument(flags.SecretsFlags())
+  group.AddArgument(flags.CommandFlag())
+  group.AddArgument(flags.DependsOnFlag())
+  group.AddArgument(flags.AddVolumeMountFlag())
+  group.AddArgument(flags.RemoveVolumeMountFlag())
+  group.AddArgument(flags.ClearVolumeMountsFlag())
+  group.AddArgument(flags.StartupProbeFlag())
+  group.AddArgument(flags.SandboxLauncherFlag())
+  return group
+
+
+def NecessaryChangesForInstancesDevSync(args):
+  """Adds necessary changes for instances used by dev sync, if not specified by flags.
+
+  1. Set SSH Enabled for the new Instance
+  2. Set port to 8080
+
+  Args:
+    args: The command-line arguments.
+
+  Returns:
+    A list of Config Changes objects to apply to the Instances for Dev Sync.
+  """
+  changes = [
+      # TODO(b/535075776): Add SSH Enabled annotation once the annotation is
+      # available.
+      # config_changes.SetAnnotationChange(
+      #     service.SERVICE_SSH_ENABLED_ANNOTATION, 'true'
+      # ),
+  ]
+  if getattr(args, 'port', None) is None:
+    changes.append(config_changes.ContainerPortChange(port='8080'))
+
+  return changes
+
+
+@base.ReleaseTracks(base.ReleaseTrack.ALPHA)
+@base.DefaultUniverseOnly
+@base.RegionalEndpointsSupported
+class Sync(base.Command):
+  """Sync into a Cloud Run Instance."""
+
+  detailed_help = {
+      'DESCRIPTION': (
+          """\
+          Syncs local workspace files to a Cloud Run Instance and streams
+          container logs concurrently.
+          """
+      ),
+      'EXAMPLES': (
+          """\
+          To sync the local workspace to a Cloud Run Instance with live log streaming:
+
+              $ {command} my-instance --source=.
+
+          To sync without tailing container logs:
+
+              $ {command} my-instance --source=. --no-tail-logs
+          """
+      ),
+  }
+
+  @classmethod
+  def CommonArgs(cls, parser):
+    flags.DevSyncCleanupFlag(parser)
+    flags.DevSyncTailLogsFlag(parser)
+    flags.DevSyncProxyFlag(parser)
+    flags.DevSyncProxyPortFlag(parser)
+    parser.add_argument(
+        '--iap-tunnel-url-override',
+        hidden=True,
+        help=(
+            'Allows for overriding the connection endpoint for integration'
+            ' testing.'
+        ),
+    )
+
+    flags.CONFIG_MAP_FLAGS.AddToParser(parser)
+    instance_presentation = presentation_specs.ResourcePresentationSpec(
+        'INSTANCE',
+        resource_args.GetInstanceResourceSpec(),
+        'Instance to sync to.',
+    )
+    flags.AddLabelsFlag(parser)
+    flags.AddServiceAccountFlag(parser)
+    flags.AddSetCloudSQLFlag(parser)
+    flags.AddVpcNetworkGroupFlagsForCreate(parser, resource_kind='instance')
+    flags.AddEgressSettingsFlag(parser)
+    flags.AddClientNameAndVersionFlags(parser)
+    flags.AddBinAuthzPolicyFlags(parser, with_clear=False)
+    flags.AddBinAuthzBreakglassFlag(parser)
+    flags.AddCmekKeyFlag(parser, with_clear=False)
+    flags.AddCmekKeyRevocationActionTypeFlag(
+        parser, with_clear=False, hidden=True
+    )
+    flags.AddEncryptionKeyShutdownHoursFlag(
+        parser, with_clear=False, hidden=True
+    )
+    flags.AddGeneralAnnotationFlags(parser)
+    flags.AddVolumesFlags(parser, cls.ReleaseTrack())
+    flags.AddIngressFlag(parser)
+    flags.AddInvokerIamCheckFlag(parser)
+    flags.AddPublicFlag(parser)
+    flags.AddRestartPolicyFlag(parser)
+    flags.AddDefaultUrlFlag(parser, resource_kind='instance')
+
+    polling_group = parser.add_mutually_exclusive_group()
+    flags.AddAsyncFlag(polling_group)
+
+    concept_parsers.ConceptParser([instance_presentation]).AddToParser(parser)
+
+  @classmethod
+  def Args(cls, parser):
+    cls.CommonArgs(parser)
+    container_args = ContainerArgGroup(cls.ReleaseTrack())
+    container_parser.AddContainerFlags(
+        parser, container_args, cls.ReleaseTrack()
+    )
+
+  def _Cleanup(self, args, instance_ref):
+    pretty_print.Info('Waiting for instance to be deleted...')
+    conn_context = connection_context.GetConnectionContext(
+        args, flags.Product.RUN, self.ReleaseTrack()
+    )
+    with serverless_operations.Connect(conn_context) as client:
+      deletion.Delete(
+          instance_ref, client.GetInstance, client.DeleteInstance, False
+      )
+      log.DeletedResource(instance_ref.instancesId, 'instance')
+
+  def _GetInstance(self, args, instance_ref):
+    conn_context = connection_context.GetConnectionContext(
+        args, flags.Product.RUN, self.ReleaseTrack()
+    )
+    with serverless_operations.Connect(conn_context) as client:
+      return client.GetInstance(instance_ref)
+
+  def _ValidateInstanceRunning(self, release_track, region, instance):
+    """Validates that the instance is in a running state for dev sync."""
+    if not instance:
+      raise exceptions.ConfigurationError(
+          'Failed to retrieve instance details.'
+      )
+    if not getattr(instance, 'is_running', True):
+      err_msg = f'Instance [{instance.name}] is not running.'
+      release_track_prefix = (
+          f' {release_track.prefix}' if release_track.prefix else ''
+      )
+      err_msg += (
+          f'\nSee logs with:\n  $ gcloud{release_track_prefix} run instances'
+          f' logs read {instance.name} --region {region}'
+      )
+      raise exceptions.ConfigurationError(err_msg)
+
+  def _GetUrl(
+      self, instance_obj: instance_lib.Instance, instance_id: str
+  ) -> str:
+    if (
+        instance_obj.annotations.get(container_resource.DISABLE_URL_ANNOTATION)
+        == 'true'
+    ):
+      raise exceptions.ArgumentError(
+          'Instance [{}] has default URL disabled. {}'.format(
+              instance_id, _NO_PROXY_HINT
+          )
+      )
+    if not instance_obj.urls:
+      raise exceptions.ArgumentError(
+          'URL for instance [{}] is not ready. {}'.format(
+              instance_id, _NO_PROXY_HINT
+          )
+      )
+    return instance_obj.urls[0]
+
+  def _StartProxy(self, args, instance_url: str) -> proxy.BackgroundProxy:
+    """Starts a local proxy to the instance and prints its localhost URL."""
+
+    bind = '127.0.0.1:' + (args.proxy_port or _DEFAULT_PROXY_PORT)
+    local_proxy = proxy.BackgroundProxy(host=instance_url, bind=bind)
+    local_proxy.Start()
+    pretty_print.Info('http://{} proxies to {}'.format(bind, instance_url))
+    return local_proxy
+
+  def Run(self, args):
+    flags.ValidatePublicFlags(args)
+
+    args.release_track = self.ReleaseTrack()
+    args.project = flags.GetProjectID(args)
+
+    instance_ref = args.CONCEPTS.instance.Parse()
+    if not instance_ref:
+      instance_name = 'i' + uuid.uuid4().hex[:10]
+      instance_ref = resources.REGISTRY.Parse(
+          instance_name,
+          params={'namespacesId': args.project},
+          collection='run.namespaces.instances',
+      )
+    flags.ValidateResource(instance_ref)
+
+    args.region = flags.GetRegion(args, prompt=False)
+    if not args.region:
+      raise exceptions.ArgumentError(
+          'Missing required argument [region]. Set --region flag or set'
+          ' run/region property.'
+      )
+
+    if not args.source:
+      if console_io.CanPrompt():
+        args.source = flags.PromptForDefaultSource()
+      else:
+        raise exceptions.ArgumentError(
+            'The --source flag must be provided to specify the source for dev'
+            ' sync.'
+        )
+
+    build_env_var_flags = map_util.GetMapFlagsFromArgs('build-env-vars', args)
+    args.build_env_vars = (
+        map_util.ApplyMapFlags(None, **build_env_var_flags) or {}
+    )
+    args.build_env_vars['GOOGLE_DEVSYNC'] = 'true'
+
+    args.deployment_name = instance_ref.Name()
+    instance = self._GetInstance(args, instance_ref)
+    existing_instance = instance is not None
+
+    if existing_instance:
+      if args.cleanup:
+        raise exceptions.ArgumentError(
+            'The --cleanup flag is not supported for dev sync to an existing'
+            ' Instance.'
+        )
+    else:
+      if (
+          args.proxy
+          and flags.FlagIsExplicitlySet(args, 'default_url')
+          and not args.default_url
+      ):
+        raise exceptions.ArgumentError(
+            'The local proxy requires the default URL, which --no-default-url'
+            ' disables. ' + _NO_PROXY_HINT
+        )
+      changes = NecessaryChangesForInstancesDevSync(args)
+      deploy_util.DeployInstanceFromSource(
+          instance_ref=instance_ref,
+          source=args.source,
+          region=args.region,
+          args=args,
+          release_track=self.ReleaseTrack(),
+          changes=changes,
+      )
+      instance = self._GetInstance(args, instance_ref)
+
+    self._ValidateInstanceRunning(args.release_track, args.region, instance)
+
+    if existing_instance:
+      pretty_print.Info(f'Syncing to existing instance: {instance.name}')
+      if instance.urls:
+        pretty_print.Info(f'Instance URL: {{bold}}{instance.urls[0]}{{reset}}')
+
+    local_proxy = None
+    try:
+      if args.proxy:
+        instance_url = self._GetUrl(instance, instance_ref.instancesId)
+        local_proxy = self._StartProxy(args, instance_url)
+
+      with execution_utils.RaisesKeyboardInterrupt():
+        sync_util.Sync(
+            args=args,
+            workload_type=constants.WorkloadType.INSTANCE,
+            source=args.source,
+        ).Run()
+    except KeyboardInterrupt:
+      pretty_print.Info(
+          'Received Keyboard Interrupt... Dev Sync Session terminated'
+      )
+    finally:
+      if local_proxy:
+        local_proxy.Stop()
+      if args.cleanup and not existing_instance:
+        self._Cleanup(args, instance_ref)

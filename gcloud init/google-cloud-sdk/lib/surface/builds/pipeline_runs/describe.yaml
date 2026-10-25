@@ -1,0 +1,32 @@
+- release_tracks: [ALPHA]
+
+  # Keeps the command out of help text, tab-completion and the public
+  # reference documentation while Cloud Build Pipelines is in preview.
+  hidden: true
+  universe_compatible: true
+
+  hints:
+    read_only: true
+
+  help_text:
+    brief: Describe a Cloud Build pipeline run.
+    description: Show the details of a Cloud Build pipeline run.
+    examples: |
+      To describe a pipeline run with ID `12345678-abcd` in region `us-central1`:
+
+        $ {command} 12345678-abcd --region=us-central1
+
+  # TODO(b/571186109): `describe` currently uses the standard full-resource
+  # YAML output used by other gcloud services. Since `PipelineRun` is a
+  # multi-stage DAG execution (`stages`), improve the display to provide a
+  # structured per-stage status and duration breakdown.
+  request:
+    collection: cloudbuild.projects.locations.pipelineRuns
+    api_version: v1
+    regional_endpoint_compatibility: SUPPORTED
+
+  arguments:
+    resource:
+      help_text: The Cloud Build pipeline run to describe.
+      spec: !REF googlecloudsdk.command_lib.cloudbuild.resources:pipeline_run
+      is_positional: true

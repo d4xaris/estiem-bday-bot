@@ -1,0 +1,35 @@
+- release_tracks: [GA, BETA, ALPHA]
+
+  help_text:
+    brief: Describe the Compute Engine project-view resource.
+    description: |
+      *{command}* displays all data associated with the Compute Engine
+      project-view resource.
+    examples: |
+      To describe the project-view resource for region `us-central1`:
+
+        $ {command} --region=us-central1
+
+  request:
+    GA:
+      api_version: v1
+    BETA:
+      api_version: beta
+    ALPHA:
+      api_version: alpha
+    collection: compute.projectViews
+    method: get
+    disable_resource_check: true
+
+  arguments:
+    params:
+    - api_field: project
+      arg_name: project
+      help_text: |
+        Project ID for this request.
+    - api_field: region
+      arg_name: region
+      required: true
+      help_text: |
+        Region of the project view.
+      fallback: googlecloudsdk.core.properties:VALUES.compute.region.Get

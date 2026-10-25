@@ -1,0 +1,28 @@
+release_tracks: [ALPHA, BETA]
+
+hints:
+  read_only: true
+
+help_text:
+  brief: |
+    Describe a `CdnEdgeExtension` resource.
+  description: |
+    Show details about a `CdnEdgeExtension` resource.
+  examples: |
+    To show details about the global `CdnEdgeExtension` resource named
+    `my-cdn-edge-extension`.
+
+      $ {command} my-cdn-edge-extension --location=global
+
+arguments:
+  resource:
+    spec: !REF googlecloudsdk.command_lib.service_extensions.resources:cdnEdgeExtension
+    help_text: ID of the `CdnEdgeExtension` resource.
+
+request: &request
+  ALPHA:
+    api_version: v1alpha1
+  BETA:
+    api_version: v1beta1
+
+  collection: networkservices.projects.locations.cdnEdgeExtensions

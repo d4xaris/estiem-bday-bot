@@ -1,6 +1,6 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { config } from "./config";
-import { getMembers, getTodaysBirthdays } from "./sheets";
+import { getMembers, getTodaysBirthdays, getGreetingsFromSheet } from "./sheets";
 import { buildGreeting } from "./greeting";
 import { sendToChat, sendToAdmins, escapeHtml } from "./telegram";
 
@@ -76,6 +76,19 @@ async function main(): Promise<void> {
     await report("🎂 Перевірку виконано: сьогодні немає днів народження.", true);
   }
 
+  // Завантажуємо таблицю з привітаннями та картинками
+  const customGreetings = await getGreetingsFromSheet();
+
+  // Генеруємо фінальний текст і картинку
+  const greetingData = buildGreeting(birthdays, customGreetings);
+
+  if (greetingData) {
+    // Відправляємо в чат і текст, і лінку на фото
+    await sendToChat(greetingData.text, greetingData.imageUrl);
+  }
+  await sendToAdmins(
+    `✅ Привітання надіслано: ${birthdays.map((m) => escapeHtml(m.name)).join(", ")}`,
+  );
   // Mark the day as done only after success (the cache step saves it at job end)
   if (!config.forceRun) writeFileSync(SENT_MARKER, new Date().toISOString());
 }
@@ -84,6 +97,8 @@ async function main(): Promise<void> {
 main().catch(async (e) => {
   console.error(e);
   const message = e instanceof Error ? e.message : String(e);
+  await sendToAdmins(`❌ Помилка бота:\n<code>${escapeHtml(message)}</code>`);
+
   await sendToAdmins(
     `❌ Помилка бота (${escapeHtml(runSource())}):\n<code>${escapeHtml(message)}</code>`,
   ).catch(console.error);

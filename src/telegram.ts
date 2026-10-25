@@ -42,8 +42,37 @@ async function sendMessage(
   if (!data.ok) throw new Error(`Telegram: ${data.description ?? res.status}`);
 }
 
+// Send a photo with a caption, retry once on 429 or 5xx
+async function sendPhotoMessage(chatId: string, caption: string, photoUrl: string, retry = true): Promise<void> {
+  const res = await fetch(`${API}/sendPhoto`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(15_000),
+    body: JSON.stringify({
+      chat_id: chatId,
+      photo: photoUrl,
+      caption: caption,
+      parse_mode: "HTML",
+    }),
+  });
+
+  if (retry && (res.status === 429 || res.status >= 500)) {
+    const retryAfter = Number(res.headers.get("retry-after")) || 3;
+    await Bun.sleep(retryAfter * 1000);
+    return sendPhotoMessage(chatId, caption, photoUrl, false);
+  }
+
+  const data = (await res.json()) as { ok: boolean; description?: string };
+  if (!data.ok) throw new Error(`Telegram sendPhoto: ${data.description ?? res.status}`);
+}
+
 // Post to the main group chat
-export function sendToChat(text: string): Promise<void> {
+export function sendToChat(text: string, imageUrl?: string): Promise<void> {
+  if (imageUrl) {
+    // Якщо є картинка — надсилаємо через новий метод
+    return sendPhotoMessage(config.chatId, text, imageUrl);
+  }
+  // Якщо картинки немає — надсилаємо просто текст старим методом
   return sendMessage(config.chatId, text);
 }
 

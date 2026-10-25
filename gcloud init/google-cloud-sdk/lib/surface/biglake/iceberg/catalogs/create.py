@@ -1,0 +1,258 @@
+# -*- coding: utf-8 -*- #
+# Copyright 2025 Google LLC. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The create command for BigLake Iceberg REST catalogs."""
+
+import textwrap
+
+from googlecloudsdk.api_lib.biglake import util
+from googlecloudsdk.calliope import base
+from googlecloudsdk.command_lib.biglake import arguments
+from googlecloudsdk.command_lib.biglake import flags
+from googlecloudsdk.core import log
+from googlecloudsdk.core.util import times
+
+help_text = textwrap.dedent("""\
+    To add a catalog using a Cloud Storage bucket `my-catalog-bucket`, run:
+
+      $ {command} my-catalog-bucket --catalog-type=gcs-bucket
+
+    To create a catalog using a Cloud Storage bucket `my-catalog-bucket` with vended credentials, run:
+
+      $ {command} my-catalog-bucket --catalog-type=gcs-bucket --credential-mode=vended-credentials
+
+    To create a catalog `my-lakehouse-catalog` with catalog type lakehouse, run:
+
+      $ {command} my-lakehouse-catalog --catalog-type=lakehouse --default-location=gs://my-bucket
+
+    To create a catalog `my-lakehouse-catalog` with cross-cloud cache enabled, run:
+
+      $ {command} my-lakehouse-catalog --catalog-type=lakehouse --default-location=gs://my-bucket --cross-cloud-cache=enabled
+
+    To create a catalog `my-lakehouse-catalog` with CMEK encryption, run:
+
+      $ {command} my-lakehouse-catalog --catalog-type=lakehouse --default-location=gs://my-bucket --kms-key=projects/my-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key
+
+    To create a unity federated catalog `my-federated-catalog`, run:
+
+      $ {command} my-federated-catalog --catalog-type=federated --federated-catalog-type=unity --service-directory-name=projects/my-project/locations/us/namespaces/my-namespace/services/my-service --unity-catalog-name=my-catalog --unity-instance-name=instance.cloud.databricks.com --unity-service-principal-application-id=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx --primary-location=us
+    """)
+
+
+def _BuildFederatedCatalogMessage(args, messages, release_track=None):
+  """Builds FederatedCatalogMessage for federated catalogs."""
+  metadata_service_directory_name = getattr(
+      args, 'metadata_service_directory_name', None
+  )
+  if args.federated_catalog_type == 'unity':
+    federated_catalog_options = messages.FederatedCatalogOptions(
+        service_directory_name=getattr(args, 'service_directory_name', None),
+        metadata_service_directory_name=metadata_service_directory_name,
+        secret_name=args.secret_name,
+        unity_catalog_info=messages.UnityCatalogInfo(
+            catalog_name=args.unity_catalog_name,
+            instance_name=args.unity_instance_name,
+            service_principal_application_id=getattr(
+                args, 'unity_service_principal_application_id', None
+            ),
+        ),
+    )
+  elif args.federated_catalog_type == 'glue':
+    federated_catalog_options = messages.FederatedCatalogOptions(
+        service_directory_name=getattr(args, 'service_directory_name', None),
+        metadata_service_directory_name=metadata_service_directory_name,
+        glue_catalog_info=messages.GlueCatalogInfo(
+            warehouse=args.glue_warehouse,
+            aws_region=args.glue_aws_region,
+            aws_role_arn=args.glue_aws_role_arn,
+        ),
+    )
+  elif args.federated_catalog_type == 'snowflake':
+    federated_catalog_options = messages.FederatedCatalogOptions(
+        secret_name=args.secret_name,
+        service_directory_name=args.service_directory_name,
+        metadata_service_directory_name=metadata_service_directory_name,
+        snowflake_catalog_info=messages.SnowflakeCatalogInfo(
+            warehouse=args.snowflake_warehouse,
+            account_identifier=args.snowflake_account_identifier,
+            snowflake_role=args.snowflake_role,
+        ),
+    )
+  elif args.federated_catalog_type == 'workday':
+    federated_catalog_options = messages.FederatedCatalogOptions(
+        secret_name=args.secret_name,
+        service_directory_name=args.service_directory_name,
+        metadata_service_directory_name=metadata_service_directory_name,
+        workday_catalog_info=messages.WorkdayCatalogInfo(
+            base_url=args.workday_base_url,
+            tenant=args.workday_tenant,
+        ),
+    )
+  else:
+    federated_catalog_options = messages.FederatedCatalogOptions(
+        metadata_service_directory_name=metadata_service_directory_name,
+    )
+
+  if release_track and args.IsKnownAndSpecified(
+      'federated_catalog_identity_mode'
+  ):
+    federated_catalog_options.identity_mode = util.GetIdentityModeEnumMapper(
+        release_track
+    ).GetEnumForChoice(args.federated_catalog_identity_mode)
+
+  # Refresh options are supported for all federated catalog types.
+  refresh_options = messages.RefreshOptions()
+  if args.refresh_interval:
+    refresh_options.refresh_schedule = messages.RefreshSchedule(
+        refresh_interval=times.FormatDurationForJson(
+            times.ParseDuration(str(args.refresh_interval) + 's')
+        )
+    )
+  if args.namespace_filters:
+    refresh_options.refresh_scope = messages.RefreshScope(
+        namespace_filters=args.namespace_filters
+    )
+  federated_catalog_options.refresh_options = refresh_options
+  return federated_catalog_options
+
+
+@base.ReleaseTracks(base.ReleaseTrack.GA)
+@base.DefaultUniverseOnly
+class CreateCatalog(base.CreateCommand):
+  """Create a BigLake Iceberg REST catalog."""
+
+  detailed_help = {
+      'EXAMPLES': help_text,
+  }
+  _support_service_directory_name = True
+  _support_metadata_service_directory_name = True
+  _support_federated_catalog = True
+  _support_glue_catalog = True
+  _support_snowflake_catalog = True
+  _support_workday_catalog = True
+  _support_unity_service_principal_application_id = True
+  _support_identity_mode = True
+
+  @classmethod
+  def Args(cls, parser):
+    flags.AddCatalogResourceArg(parser, 'to create')
+    util.GetCredentialModeEnumMapper(cls.ReleaseTrack()).choice_arg.AddToParser(
+        parser
+    )
+    if cls._support_identity_mode:
+      util.GetIdentityModeEnumMapper(cls.ReleaseTrack()).choice_arg.AddToParser(
+          parser
+      )
+    util.GetCatalogTypeEnumMapper(cls.ReleaseTrack()).choice_arg.AddToParser(
+        parser
+    )
+    arguments.AddCatalogsCreateArgs(parser)
+    if cls._support_federated_catalog:
+      arguments.AddFederatedCatalogArgs(
+          parser,
+          support_snowflake=cls._support_snowflake_catalog,
+          support_workday=cls._support_workday_catalog,
+      )
+    if cls._support_glue_catalog:
+      arguments.AddGlueCatalogArgs(parser)
+    if cls._support_snowflake_catalog:
+      arguments.AddSnowflakeCatalogArgs(parser)
+    if cls._support_workday_catalog:
+      arguments.AddWorkdayCatalogArgs(parser)
+    if cls._support_service_directory_name:
+      arguments.AddServiceDirectoryNameArg(parser)
+    if cls._support_metadata_service_directory_name:
+      arguments.AddMetadataServiceDirectoryNameArg(parser)
+    if cls._support_unity_service_principal_application_id:
+      arguments.AddUnityServicePrincipalApplicationIdArg(parser)
+
+  def Run(self, args):
+    util.CheckValidArgCombinations(args)
+    if self._support_federated_catalog:
+      util.CheckValidFederatedArgCombinations(args)
+    client = util.GetClientInstance(self.ReleaseTrack())
+    messages = client.MESSAGES_MODULE
+
+    catalog_name = util.GetCatalogName(args.catalog)
+
+    credential_mode = None
+    if args.IsSpecified('credential_mode'):
+      credential_mode = util.GetCredentialModeEnumMapper(
+          self.ReleaseTrack()
+      ).GetEnumForChoice(args.credential_mode)
+
+    catalog = messages.IcebergCatalog(
+        name=catalog_name,
+        catalog_type=util.GetCatalogTypeEnumMapper(
+            self.ReleaseTrack()
+        ).GetEnumForChoice(args.catalog_type),
+        credential_mode=credential_mode,
+    )
+    if args.IsSpecified('cross_cloud_cache'):
+      catalog.cross_cloud_cache_options = messages.CrossCloudCacheOptions(
+          enabled=(args.cross_cloud_cache == 'enabled')
+      )
+    if args.IsSpecified('description'):
+      catalog.description = args.description
+    if args.IsSpecified('default_location'):
+      catalog.default_location = args.default_location
+    if args.IsSpecified('restricted_locations'):
+      catalog.restricted_locations_config = messages.RestrictedLocationsConfig(
+          restricted_locations=args.restricted_locations
+      )
+
+    kms_key = arguments.GetAndValidateKmsKeyName(args)
+    if kms_key:
+      catalog.encryption_config = messages.EncryptionConfig(
+          kms_key_name=kms_key
+      )
+
+    if self._support_federated_catalog and args.catalog_type == 'federated':
+      catalog.federated_catalog_options = _BuildFederatedCatalogMessage(
+          args, messages, release_track=self.ReleaseTrack()
+      )
+
+    response = util.CreateCatalog(
+        args.catalog,
+        catalog,
+        primary_location=(args.primary_location),
+    )
+    if response:
+      log.CreatedResource(catalog_name, 'catalog')
+      if response.biglake_service_account:
+        log.status.Print(
+            'BigLake service account: {}'.format(
+                response.biglake_service_account
+            )
+        )
+      if response.biglake_service_account_id:
+        log.status.Print(
+            'BigLake service account ID: {}'.format(
+                response.biglake_service_account_id
+            )
+        )
+    return response
+
+
+@base.ReleaseTracks(base.ReleaseTrack.BETA)
+class CreateBeta(CreateCatalog):
+  """Create a BigLake Iceberg REST catalog."""
+
+
+@base.ReleaseTracks(base.ReleaseTrack.ALPHA)
+class CreateAlpha(CreateBeta):
+  """Create a BigLake Iceberg REST catalog."""
+
+  _support_metadata_service_directory_name = True
+  _support_identity_mode = True

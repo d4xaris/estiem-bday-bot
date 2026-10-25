@@ -1,0 +1,30 @@
+- release_tracks: [ALPHA]
+  hints:
+    read_only: false
+
+  help_text:
+    brief: Delete a spoke.
+    description: Delete the specified spoke.
+    examples: |
+      To delete a spoke with name ``myspoke'' in region ``us-central1'', run:
+
+        $ {command} myspoke --region=us-central1
+
+  arguments:
+    resource:
+      spec: !REF googlecloudsdk.command_lib.network_connectivity.resources:spoke
+      help_text: Name of the spoke to be deleted.
+
+  async:
+    collection: networkconnectivity.projects.locations.operations
+
+  request: &request
+    ALPHA:
+      api_version: v1alpha1
+    method: delete
+    collection: networkconnectivity.projects.locations.spokes
+
+- release_tracks: [BETA, GA]
+  is_python_command: true
+  hints:
+    read_only: false
