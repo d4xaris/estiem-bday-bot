@@ -1,6 +1,8 @@
 import { escapeHtml } from './telegram';
 import type { Member, GreetingRow } from './sheets';
 
+const PLACEHOLDER = '[імʼя]';
+
 const GREETINGS = [
     "Настрою чумового, Свята тобі крутого, Любові до запаморочення, Вітаю [імʼя] з Днем Народження 🥂",
     "Усього келих за здоров'я [імʼя]! З днем народження 🍻",
@@ -102,4 +104,33 @@ export function buildGreeting(members: Member[], customGreetings: GreetingRow[] 
     const finalText = selectedText.replace(/\[імʼя\]/gi, namesString);
 
     return { text: finalText, imageUrl: selectedImage };
+];
+
+// "Прізвище Ім'я По батькові" -> "Ім'я Прізвище"
+function displayName(fullName: string): string {
+    const parts = fullName.trim().split(/\s+/);
+    return parts.length >= 2 ? `${parts[1]} ${parts[0]}` : parts[0] ?? '';
+}
+
+// Ім'я жирним + @username для тегу (якщо нік є)
+function formatMember(member: Member): string {
+    const name = `<b>${escapeHtml(displayName(member.name))}</b>`;
+    const username = member.username.trim().replace(/^@/, '');
+    return username ? `${name} @${escapeHtml(username)}` : name;
+}
+
+// ["А"] -> "А"; ["А","Б"] -> "А та Б"; ["А","Б","В"] -> "А, Б та В"
+function joinNames(items: string[]): string {
+    if (items.length <= 1) return items[0] ?? '';
+    return `${items.slice(0, -1).join(', ')} та ${items[items.length - 1]}`;
+}
+
+export function buildGreeting(members: Member[]): string {
+    if (members.length === 0) return '';
+
+    const names = joinNames(members.map(formatMember));
+    const template = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
+
+    // Буквальна заміна: без regex, а функція захищає від спецпослідовностей на кшталт $&
+    return template.replaceAll(PLACEHOLDER, () => names);
 }

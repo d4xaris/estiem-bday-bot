@@ -7,8 +7,18 @@ export function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+interface SendOptions {
+  // Deliver without sound/vibration
+  silent?: boolean;
+}
+
 // Send one message, retry once on 429 or 5xx
-async function sendMessage(chatId: string, text: string, retry = true): Promise<void> {
+async function sendMessage(
+  chatId: string,
+  text: string,
+  options: SendOptions = {},
+  retry = true,
+): Promise<void> {
   const res = await fetch(`${API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -18,13 +28,14 @@ async function sendMessage(chatId: string, text: string, retry = true): Promise<
       text,
       parse_mode: "HTML",
       link_preview_options: { is_disabled: true },
+      disable_notification: options.silent ?? false,
     }),
   });
 
   if (retry && (res.status === 429 || res.status >= 500)) {
     const retryAfter = Number(res.headers.get("retry-after")) || 3;
     await Bun.sleep(retryAfter * 1000);
-    return sendMessage(chatId, text, false);
+    return sendMessage(chatId, text, options, false);
   }
 
   const data = (await res.json()) as { ok: boolean; description?: string };
@@ -66,9 +77,12 @@ export function sendToChat(text: string, imageUrl?: string): Promise<void> {
 }
 
 // DM all admins in parallel, only log failures
-export async function sendToAdmins(text: string): Promise<void> {
+export async function sendToAdmins(
+  text: string,
+  options: SendOptions = {},
+): Promise<void> {
   const results = await Promise.allSettled(
-    config.adminIds.map((id) => sendMessage(id, text)),
+    config.adminIds.map((id) => sendMessage(id, text, options)),
   );
   results.forEach((r, i) => {
     if (r.status === "rejected") {
