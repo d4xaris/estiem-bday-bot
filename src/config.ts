@@ -1,13 +1,12 @@
+import { existsSync } from "node:fs";
+
 // Required environment variables
-const REQUIRED = [
-  "BOT_TOKEN",
-  "CHAT_ID",
-  "ADMIN_ID",
-  "SHEET_ID",
-  "GOOGLE_SERVICE_ACCOUNT",
-] as const;
+const REQUIRED = ["BOT_TOKEN", "CHAT_ID", "ADMIN_ID", "SHEET_ID"] as const;
 
 type EnvName = (typeof REQUIRED)[number];
+
+// Fallback key file (local runs / when the env variable is broken)
+export const SERVICE_ACCOUNT_FILE = "service-account.json";
 
 // Check all variables are set, report every missing one at once
 function loadEnv(): Record<EnvName, string> {
@@ -57,7 +56,23 @@ function parseSheetId(raw: string): string {
 }
 
 const env = loadEnv();
-const googleServiceAccount = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
+
+// The env variable is optional if the key file exists; a broken value is not fatal either
+const rawServiceAccount = process.env.GOOGLE_SERVICE_ACCOUNT?.trim();
+let googleServiceAccount: ServiceAccount | null = null;
+if (rawServiceAccount) {
+  try {
+    googleServiceAccount = parseServiceAccount(rawServiceAccount);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+if (!googleServiceAccount && !existsSync(SERVICE_ACCOUNT_FILE)) {
+  throw new Error(
+    `Немає ключа сервісного акаунта: задайте GOOGLE_SERVICE_ACCOUNT або покладіть ${SERVICE_ACCOUNT_FILE}`,
+  );
+}
 
 export const config = {
   botToken: env.BOT_TOKEN,

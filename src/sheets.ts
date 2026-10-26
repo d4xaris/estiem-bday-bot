@@ -1,5 +1,6 @@
+import { existsSync } from 'node:fs';
 import { GoogleAuth } from 'google-auth-library';
-import { config } from './config';
+import { config, SERVICE_ACCOUNT_FILE } from './config';
 
 export interface Member {
     name: string;
@@ -8,8 +9,40 @@ export interface Member {
     status: string;   // Колонка C
 }
 
-// Токен із повторними спробами (Google інколи тимчасово відхиляє підпис)
-async function getTokenWithRetry(auth: GoogleAuth, attempts = 3): Promise<string> {
+export interface GreetingRow {
+    text: string;
+    imageUrl: string;
+}
+
+const SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly'];
+
+// Способи авторизації за пріоритетом: 1) змінна GOOGLE_SERVICE_ACCOUNT, 2) файл service-account.json
+function createAuths(): { name: string; auth: GoogleAuth }[] {
+    const auths: { name: string; auth: GoogleAuth }[] = [];
+
+    const sa = config.googleServiceAccount;
+    if (sa) {
+        auths.push({
+            name: 'GOOGLE_SERVICE_ACCOUNT',
+            auth: new GoogleAuth({
+                credentials: { client_email: sa.client_email, private_key: sa.private_key },
+                scopes: SCOPES,
+            }),
+        });
+    }
+
+    if (existsSync(SERVICE_ACCOUNT_FILE)) {
+        auths.push({
+            name: SERVICE_ACCOUNT_FILE,
+            auth: new GoogleAuth({ keyFile: SERVICE_ACCOUNT_FILE, scopes: SCOPES }),
+        });
+    }
+
+    return auths;
+}
+
+// Токен для одного способу, з повторними спробами (Google інколи тимчасово відхиляє підпис)
+async function getTokenWithRetry(auth: GoogleAuth, attempts = 2): Promise<string> {
     for (let i = 1; i <= attempts; i++) {
         try {
             const token = await auth.getAccessToken();
@@ -17,21 +50,31 @@ async function getTokenWithRetry(auth: GoogleAuth, attempts = 3): Promise<string
         } catch (e) {
             if (i === attempts) throw e;
         }
-        await new Promise((r) => setTimeout(r, 5000 * i));
+        await new Promise((r) => setTimeout(r, 3000 * i));
     }
     throw new Error('Не вдалося отримати access token для сервісного акаунта');
+}
+
+// Пробуємо способи по черзі: не спрацював перший, беремо наступний
+async function getAccessToken(): Promise<string> {
+    let lastError: unknown = new Error('Немає жодного ключа сервісного акаунта');
+
+    for (const { name, auth } of createAuths()) {
+        try {
+            return await getTokenWithRetry(auth);
+        } catch (e) {
+            console.error(`Авторизація через ${name} не вдалася:`, e);
+            lastError = e;
+        }
+    }
+
+    throw lastError;
 }
 
 export async function getMembers(): Promise<Member[]> {
     const members: Member[] = [];
 
-    // Авторизація через локальний файл ключа (вирішує проблему Invalid JWT Signature)
-    const auth = new GoogleAuth({
-        keyFile: 'service-account.json',
-        scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-    });
-
-    const accessToken = await getTokenWithRetry(auth);
+    const accessToken = await getAccessToken();
 
     // A:E, щоб індекси збігалися з колонками:
     // row[1] = B (ім'я), row[2] = C (статус), row[3] = D (дата), row[4] = E (нікнейм)
@@ -48,7 +91,6 @@ export async function getMembers(): Promise<Member[]> {
     const data = await response.json();
     const rows: string[][] = data.values || [];
 
-    // Обробка рядків таблиці
     for (const row of rows) {
         const rawName = row[1] || '';
         const rawStatus = row[2] || '';
@@ -60,7 +102,7 @@ export async function getMembers(): Promise<Member[]> {
                 name: rawName.trim(),
                 username: rawUsername.trim().replace(/^@/, ''),
                 birthday: rawBirthday.trim(),
-                status: rawStatus.trim()
+                status: rawStatus.trim(),
             });
         }
     }
@@ -108,7 +150,7 @@ function getKyivDateParts(): { day: number; month: number; year: number } {
     }).formatToParts(new Date());
 
     const get = (type: string) =>
-        parseInt(parts.find(p => p.type === type)!.value, 10);
+        parseInt(parts.find((p) => p.type === type)!.value, 10);
 
     return { day: get('day'), month: get('month'), year: get('year') };
 }
@@ -119,7 +161,7 @@ export function getTodaysBirthdays(members: Member[]): Member[] {
     const isLeapYear =
         (currentYear % 4 === 0 && currentYear % 100 !== 0) || currentYear % 400 === 0;
 
-    return members.filter(member => {
+    return members.filter((member) => {
         // Вітаємо лише Active та Alumni
         const status = member.status.toLowerCase();
         if (status !== 'active' && status !== 'alumni') return false;
@@ -137,49 +179,41 @@ export function getTodaysBirthdays(members: Member[]): Member[] {
         return bDay === currentDay && bMonth === currentMonth;
     });
 }
-export interface GreetingRow {
-    text: string;
-    imageUrl: string;
-}
 
+// Привітання з вкладки Greetings: A = текст з міткою [ім'я], B = URL картинки/гіфки (необов'язково).
+// Заголовок необов'язковий: перший рядок пропускається, лише якщо в ньому немає мітки.
+// Якщо вкладка недоступна або порожня, кидає помилку (index.ts її ловить і бере запасні фрази).
 export async function getGreetingsFromSheet(): Promise<GreetingRow[]> {
-    try {
-        const auth = new GoogleAuth({
-            keyFile: 'service-account.json',
-            scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-        });
-        const accessToken = await auth.getAccessToken();
+    const accessToken = await getAccessToken();
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.sheetId}/values/Greetings!A:B`;
+    const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(15_000),
+    });
 
-        // Забираємо дані з вкладки Greetings (колонки A та B)
-        const url = `https://sheets.googleapis.com/v4/spreadsheets/${config.sheetId}/values/Greetings!A:B`;
-        const response = await fetch(url, {
-            headers: { Authorization: `Bearer ${accessToken}` },
-        });
-
-        if (!response.ok) {
-            console.log("Вкладка Greetings недоступна. Використовуємо дефолтні привітання.");
-            return [];
-        }
-
-        const data = await response.json();
-        const rows: string[][] = data.values || [];
-
-        const greetings: GreetingRow[] = [];
-        // Пропускаємо перший рядок, бо там заголовки
-        for (const row of rows.slice(1)) {
-            const text = row[0] || '';
-            const imageUrl = row[1] || '';
-
-            if (text.trim()) {
-                greetings.push({
-                    text: text.trim(),
-                    imageUrl: imageUrl.trim()
-                });
-            }
-        }
-        return greetings;
-    } catch (error) {
-        console.error("Помилка завантаження привітань з таблиці:", error);
-        return [];
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Вкладка Greetings недоступна: ${response.status} ${body}`);
     }
+
+    const data = await response.json();
+    let rows: string[][] = data.values || [];
+
+    // Якщо перший рядок схожий на заголовок (немає мітки імені), пропускаємо його
+    const looksLikeHeader = rows.length > 0 && !/\[[^\]]*(?:м['’ʼ`]?я|name)[^\]]*\]/i.test(rows[0][0] || '');
+    if (looksLikeHeader) rows = rows.slice(1);
+
+    const greetings = rows
+        .map((row) => ({
+            // Прибираємо зайву кому/пробіли в кінці тексту
+            text: (row[0] || '').trim().replace(/[\s,]+$/, ''),
+            imageUrl: (row[1] || '').trim(),
+        }))
+        .filter((g) => g.text);
+
+    if (greetings.length === 0) {
+        throw new Error('Вкладка Greetings порожня: додайте хоча б одне привітання');
+    }
+
+    return greetings;
 }

@@ -1,6 +1,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { config } from "./config";
 import { getMembers, getTodaysBirthdays, getGreetingsFromSheet } from "./sheets";
+import type { GreetingRow } from "./sheets";
 import { buildGreeting } from "./greeting";
 import { sendToChat, sendToAdmins, escapeHtml } from "./telegram";
 
@@ -53,7 +54,6 @@ async function main(): Promise<void> {
 
   if (!config.forceRun) {
     // GitHub cron can be delayed by hours, so run at any time from 09:00 on.
-    // Before 09:00 (e.g. the winter cron firing at 08:07 in summer) we wait.
     if (hour < 9) {
       await report("⏭ Ще немає 09:00 за Києвом, пропускаю.", true);
       return;
@@ -67,28 +67,30 @@ async function main(): Promise<void> {
   }
 
   const birthdays = getTodaysBirthdays(await getMembers());
-  if (birthdays.length > 0) {
-    await sendToChat(buildGreeting(birthdays));
+
+  if (birthdays.length === 0) {
+    await report("🎂 Перевірку виконано: сьогодні немає днів народження.", true);
+  } else {
+    // Greetings tab: if it fails or is empty, buildGreeting uses the built-in phrases; admins get a warning
+    let greetings: GreetingRow[] = [];
+    try {
+      greetings = await getGreetingsFromSheet();
+    } catch (e) {
+      console.error(e);
+      const reason = e instanceof Error ? e.message : String(e);
+      await sendToAdmins(
+        `⚠️ Вкладка Greetings не спрацювала, надіслано запасне привітання:\n<code>${escapeHtml(reason)}</code>`,
+      ).catch(console.error);
+    }
+
+    const greeting = buildGreeting(birthdays, greetings);
+    if (greeting) await sendToChat(greeting.text, greeting.imageUrl);
+
     await sendToAdmins(
       `✅ Привітання надіслано: ${birthdays.map((m) => escapeHtml(m.name)).join(", ")}`,
     );
-  } else {
-    await report("🎂 Перевірку виконано: сьогодні немає днів народження.", true);
   }
 
-  // Завантажуємо таблицю з привітаннями та картинками
-  const customGreetings = await getGreetingsFromSheet();
-
-  // Генеруємо фінальний текст і картинку
-  const greetingData = buildGreeting(birthdays, customGreetings);
-
-  if (greetingData) {
-    // Відправляємо в чат і текст, і лінку на фото
-    await sendToChat(greetingData.text, greetingData.imageUrl);
-  }
-  await sendToAdmins(
-    `✅ Привітання надіслано: ${birthdays.map((m) => escapeHtml(m.name)).join(", ")}`,
-  );
   // Mark the day as done only after success (the cache step saves it at job end)
   if (!config.forceRun) writeFileSync(SENT_MARKER, new Date().toISOString());
 }
@@ -97,8 +99,6 @@ async function main(): Promise<void> {
 main().catch(async (e) => {
   console.error(e);
   const message = e instanceof Error ? e.message : String(e);
-  await sendToAdmins(`❌ Помилка бота:\n<code>${escapeHtml(message)}</code>`);
-
   await sendToAdmins(
     `❌ Помилка бота (${escapeHtml(runSource())}):\n<code>${escapeHtml(message)}</code>`,
   ).catch(console.error);

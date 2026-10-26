@@ -1,9 +1,9 @@
 import { escapeHtml } from './telegram';
 import type { Member, GreetingRow } from './sheets';
 
-const PLACEHOLDER = '[імʼя]';
+const PLACEHOLDER_RE = /\[\s*(?:[іи]м['’ʼ`]?я|name)\s*\]/gi;
 
-const GREETINGS = [
+const GREETINGS: string[] = [
     "Настрою чумового, Свята тобі крутого, Любові до запаморочення, Вітаю [імʼя] з Днем Народження 🥂",
     "Усього келих за здоров'я [імʼя]! З днем народження 🍻",
     "До чого ж класний день сьогодні. День народження [імʼя] ☀️",
@@ -44,7 +44,7 @@ const GREETINGS = [
     "Сьогодні свято! [імʼя], ми бажаємо тобі відчувати себе на всі 100% щодня і впевнено йти до своєї мети! 🎯",
     "Happy B-Day, [імʼя]! Бажаємо, щоб усе склалося навіть краще, ніж ти плануєш! Лови кожну мить! 💫",
     "З днем народження, [імʼя]! Бажаємо яскравих ідей, крутих людей поруч і безмежного щастя від усіх нас! 💛",
-    "Happy Birthday, [імʼя]! Бажаємо, щоб натхнення било ключем, а всі життєві завдання вирішувалися легко та елегантно!️😎",
+    "Happy Birthday, [імʼя]! Бажаємо, щоб натхнення било ключем, а всі життєві завдання вирішувалися легко та елегантно! 😎",
     "Сьогодні день народження у зірки! [імʼя], бажаємо сяяти ще яскравіше і підкорювати будь-які вершини! 🚀",
     "Happy B-Day, [імʼя]! Бажаємо легких буднів, шалених вихідних і щоб усе завжди встигалося вчасно! ⏰",
     "З днем народження, [імʼя]! Бажаємо, щоб життя нагадувало круту подорож, де за кожним поворотом чекає щось неймовірне! 💙",
@@ -65,45 +65,7 @@ const GREETINGS = [
     "Happy B-Day, [імʼя]! Бажаємо, щоб кожен день відкривав нові двері до твого успіху! Вір у себе і лети до мети! 🌟",
     "З днем народження, [імʼя]! Від усієї команди бажаємо гармонії всередині, драйву зовні і щоб усі пазли в житті складалися ідеально! 🧩",
     "Happy Birthday, [імʼя]! Бажаємо, щоб світ навколо надихав, а будь-які труднощі вирішувалися легко та з посмішкою! ✨",
-    "Сьогодні твій день, [імʼя]! Ми бажаємо тобі неймовірного щастя, щирих емоцій і щоб кожен день був абсолютно особливим! 🥳"
-];
-
-export function buildGreeting(members: Member[], customGreetings: GreetingRow[] = []): { text: string; imageUrl?: string } | null {
-    if (members.length === 0) {
-        return null;
-    }
-
-    // Формуємо красивий рядок з іменами (і тегами, якщо є)
-    const memberTags = members.map(member => {
-        const safeName = escapeHtml(member.name);
-        if (member.username) {
-            const safeUsername = escapeHtml(member.username);
-            return `<b>${safeName}</b> @${safeUsername}`;
-        } else {
-            return `<b>${safeName}</b>`;
-        }
-    });
-
-    const namesString = memberTags.join(', ');
-
-    let selectedText = "";
-    let selectedImage: string | undefined = undefined;
-
-    // Якщо таблиця порожня або недоступна — беремо з твого масиву GREETINGS
-    if (!customGreetings || customGreetings.length === 0) {
-        const randomIndex = Math.floor(Math.random() * GREETINGS.length);
-        selectedText = GREETINGS[randomIndex];
-    } else {
-        // Якщо таблиця має дані — беремо текст і картинку з неї
-        const randomIndex = Math.floor(Math.random() * customGreetings.length);
-        selectedText = customGreetings[randomIndex].text;
-        selectedImage = customGreetings[randomIndex].imageUrl || undefined;
-    }
-
-    // Замінюємо тег [імʼя] на рядок з іменами іменинників
-    const finalText = selectedText.replace(/\[імʼя\]/gi, namesString);
-
-    return { text: finalText, imageUrl: selectedImage };
+    "Сьогодні твій день, [імʼя]! Ми бажаємо тобі неймовірного щастя, щирих емоцій і щоб кожен день був абсолютно особливим! 🥳",
 ];
 
 // "Прізвище Ім'я По батькові" -> "Ім'я Прізвище"
@@ -125,12 +87,29 @@ function joinNames(items: string[]): string {
     return `${items.slice(0, -1).join(', ')} та ${items[items.length - 1]}`;
 }
 
-export function buildGreeting(members: Member[]): string {
-    if (members.length === 0) return '';
+export function buildGreeting(
+    members: Member[],
+    greetings: GreetingRow[] = [],
+): { text: string; imageUrl?: string } | null {
+    if (members.length === 0) return null;
 
     const names = joinNames(members.map(formatMember));
-    const template = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
 
-    // Буквальна заміна: без regex, а функція захищає від спецпослідовностей на кшталт $&
-    return template.replaceAll(PLACEHOLDER, () => names);
+    // Таблиця має пріоритет, порожня або недоступна: запасний масив із коду
+    const pool: GreetingRow[] =
+        greetings.length > 0
+            ? greetings
+            : GREETINGS.map((text) => ({ text, imageUrl: '' }));
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+
+    // Екрануємо текст, щоб випадкові < > & не зламали HTML-режим Telegram
+    const template = escapeHtml(pick.text);
+
+    // Якщо в тексті забули мітку, ставимо імена на початок
+    const hasPlaceholder = new RegExp(PLACEHOLDER_RE.source, 'i').test(template);
+    const text = hasPlaceholder
+        ? template.replace(PLACEHOLDER_RE, () => names) // функція захищає від $& тощо
+        : `${names}\n\n${template}`;
+
+    return { text, imageUrl: pick.imageUrl || undefined };
 }

@@ -2,6 +2,9 @@ import { config } from "./config";
 
 const API = `https://api.telegram.org/bot${config.botToken}`;
 
+// Telegram limit for photo/animation captions
+const CAPTION_LIMIT = 1024;
+
 // Escape special characters so names don't break HTML parse mode
 export function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -12,68 +15,75 @@ interface SendOptions {
   silent?: boolean;
 }
 
-// Send one message, retry once on 429 or 5xx
+// Call any Bot API method, retry once on 429 or 5xx
+async function callApi(
+  method: string,
+  payload: Record<string, unknown>,
+  retry = true,
+): Promise<void> {
+  const res = await fetch(`${API}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(15_000),
+    body: JSON.stringify(payload),
+  });
+
+  if (retry && (res.status === 429 || res.status >= 500)) {
+    const retryAfter = Number(res.headers.get("retry-after")) || 3;
+    await Bun.sleep(retryAfter * 1000);
+    return callApi(method, payload, false);
+  }
+
+  const data = (await res.json()) as { ok: boolean; description?: string };
+  if (!data.ok) throw new Error(`Telegram ${method}: ${data.description ?? res.status}`);
+}
+
+// Send one text message
 async function sendMessage(
   chatId: string,
   text: string,
   options: SendOptions = {},
-  retry = true,
 ): Promise<void> {
-  const res = await fetch(`${API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(15_000),
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      link_preview_options: { is_disabled: true },
-      disable_notification: options.silent ?? false,
-    }),
+  await callApi("sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    disable_notification: options.silent ?? false,
   });
-
-  if (retry && (res.status === 429 || res.status >= 500)) {
-    const retryAfter = Number(res.headers.get("retry-after")) || 3;
-    await Bun.sleep(retryAfter * 1000);
-    return sendMessage(chatId, text, options, false);
-  }
-
-  const data = (await res.json()) as { ok: boolean; description?: string };
-  if (!data.ok) throw new Error(`Telegram: ${data.description ?? res.status}`);
 }
 
-// Send a photo with a caption, retry once on 429 or 5xx
-async function sendPhotoMessage(chatId: string, caption: string, photoUrl: string, retry = true): Promise<void> {
-  const res = await fetch(`${API}/sendPhoto`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(15_000),
-    body: JSON.stringify({
-      chat_id: chatId,
-      photo: photoUrl,
-      caption: caption,
-      parse_mode: "HTML",
-    }),
+// Send a picture with a caption. GIF/MP4 links go through sendAnimation,
+// because sendPhoto shows GIFs as a static image or rejects them.
+export async function sendPhoto(
+  chatId: string,
+  photoUrl: string,
+  caption: string,
+  options: SendOptions = {},
+): Promise<void> {
+  const isAnimation = /\.(gif|mp4)(\?.*)?$/i.test(photoUrl);
+  await callApi(isAnimation ? "sendAnimation" : "sendPhoto", {
+    chat_id: chatId,
+    [isAnimation ? "animation" : "photo"]: photoUrl,
+    ...(caption ? { caption, parse_mode: "HTML" } : {}),
+    disable_notification: options.silent ?? false,
   });
-
-  if (retry && (res.status === 429 || res.status >= 500)) {
-    const retryAfter = Number(res.headers.get("retry-after")) || 3;
-    await Bun.sleep(retryAfter * 1000);
-    return sendPhotoMessage(chatId, caption, photoUrl, false);
-  }
-
-  const data = (await res.json()) as { ok: boolean; description?: string };
-  if (!data.ok) throw new Error(`Telegram sendPhoto: ${data.description ?? res.status}`);
 }
 
-// Post to the main group chat
-export function sendToChat(text: string, imageUrl?: string): Promise<void> {
-  if (imageUrl) {
-    // Якщо є картинка — надсилаємо через новий метод
-    return sendPhotoMessage(config.chatId, text, imageUrl);
+// Post to the main group chat. With an image: photo + caption.
+// If the image is broken/unreachable, fall back to plain text so the greeting is never lost.
+export async function sendToChat(text: string, imageUrl?: string): Promise<void> {
+  if (!imageUrl) return sendMessage(config.chatId, text);
+
+  const fitsCaption = text.length <= CAPTION_LIMIT;
+  try {
+    await sendPhoto(config.chatId, imageUrl, fitsCaption ? text : "");
+  } catch (e) {
+    console.error(`Не вдалося надіслати картинку ${imageUrl}, шлю лише текст:`, e);
+    return sendMessage(config.chatId, text);
   }
-  // Якщо картинки немає — надсилаємо просто текст старим методом
-  return sendMessage(config.chatId, text);
+  // Text too long for a caption: it goes right after the picture
+  if (!fitsCaption) await sendMessage(config.chatId, text);
 }
 
 // DM all admins in parallel, only log failures
